@@ -42,7 +42,28 @@ func (e *LMCacheEngine) ValidateSpec() field.ErrorList {
 
 	errs = append(errs, validateL2BackendSpec(spec.L2Backend)...)
 	errs = append(errs, validateCoordinatorConnectionSpec(spec.Coordinator)...)
+	errs = append(errs, validateWorkloadAwareSchedulingSpec(spec.WorkloadAwareScheduling)...)
 
+	return errs
+}
+
+// validateWorkloadAwareSchedulingSpec enforces the workload-selector contract:
+// enabled requires a non-empty LabelSelector. The check matters because an
+// empty LabelSelector matches every pod — one malformed CR would label every
+// node running anything in the namespace.
+func validateWorkloadAwareSchedulingSpec(w *WorkloadAwareSchedulingSpec) field.ErrorList {
+	var errs field.ErrorList
+	if w == nil || !w.Enabled {
+		return errs
+	}
+	if w.WorkloadSelector == nil {
+		return append(errs, field.Required(field.NewPath("spec", "workloadAwareScheduling", "workloadSelector"), "is required when workloadAwareScheduling is enabled"))
+	}
+	if len(w.WorkloadSelector.MatchLabels) == 0 && len(w.WorkloadSelector.MatchExpressions) == 0 {
+		return append(errs, field.Invalid(
+			field.NewPath("spec", "workloadAwareScheduling", "workloadSelector"), w.WorkloadSelector,
+			"must not be empty when workloadAwareScheduling is enabled: an empty LabelSelector matches every pod and would label every node in the namespace"))
+	}
 	return errs
 }
 
