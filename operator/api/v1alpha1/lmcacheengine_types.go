@@ -708,12 +708,15 @@ type LMCacheEngineStatus struct {
 	// +optional
 	WorkloadLabelKey string `json:"workloadLabelKey,omitempty"`
 
-	// nodeLastSeen tracks when a node was last seen hosting matching
-	// workload pods; nodes keep their label until the last-seen time falls
-	// outside releaseDelaySeconds. Internal bookkeeping.
+	// nodeAbsentSince records when a node carrying the managed label was
+	// FIRST observed without matching workload pods. The release window runs
+	// from that moment — not from when the workload was last seen — so an
+	// interrupted controller that missed the actual departure still grants
+	// the full releaseDelaySeconds. Entries clear when the workload returns
+	// to the node or the label is removed. Internal bookkeeping.
 	// +optional
 	// +kubebuilder:example={"node-a":"2026-10-19T09:00:00Z"}
-	NodeLastSeen map[string]metav1.Time `json:"nodeLastSeen,omitempty"`
+	NodeAbsentSince map[string]metav1.Time `json:"nodeAbsentSince,omitempty"`
 }
 
 // +kubebuilder:object:root=true

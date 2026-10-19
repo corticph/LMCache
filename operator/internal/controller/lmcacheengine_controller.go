@@ -33,7 +33,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
-	"github.com/LMCache/LMCache/internal/placement"
 	"github.com/LMCache/LMCache/internal/resources"
 )
 
@@ -104,7 +103,7 @@ func (r *LMCacheEngineReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, err
 			}
 		}
-		delay, err := placement.Reconcile(ctx, r.Client, engine, time.Now())
+		delay, err := reconcileWorkloadPlacement(ctx, r.Client, engine, time.Now())
 		if err != nil {
 			log.Error(err, "Failed to reconcile workload-aware placement labels")
 			return ctrl.Result{}, err
@@ -114,7 +113,7 @@ func (r *LMCacheEngineReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Disabled-after-enabled: one Placement pass runs on the disabled
 		// path (strips leftover labels, resets status), then the finalizer
 		// is dropped so CR deletion never blocks on it.
-		if _, err := placement.Reconcile(ctx, r.Client, engine, time.Now()); err != nil {
+		if _, err := reconcileWorkloadPlacement(ctx, r.Client, engine, time.Now()); err != nil {
 			return ctrl.Result{}, err
 		}
 		controllerutil.RemoveFinalizer(engine, workloadPlacementFinalizer)
@@ -174,17 +173,20 @@ func (r *LMCacheEngineReconciler) enginesForPod(ctx context.Context, obj client.
 	if !ok {
 		return nil
 	}
+	// Scope the list to the pod's namespace: workload-aware engines only
+	// ever match pods in their own namespace, so a cluster-wide copy on
+	// every pod event would be pure waste (unrelated system pods included).
 	engines := &lmcachev1alpha1.LMCacheEngineList{}
-	if err := r.List(ctx, engines); err != nil {
+	if err := r.List(ctx, engines, client.InNamespace(pod.Namespace)); err != nil {
 		return nil
 	}
 	var out []reconcile.Request
 	for i := range engines.Items {
 		engine := &engines.Items[i]
-		if engine.Namespace != pod.Namespace || !engine.WorkloadSchedulingEnabled() {
+		if !engine.WorkloadSchedulingEnabled() {
 			continue
 		}
-		if !placement.Matches(engine, pod.Labels) {
+		if !workloadMatches(engine, pod.Labels) {
 			continue
 		}
 		out = append(out, reconcile.Request{

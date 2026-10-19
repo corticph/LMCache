@@ -1040,8 +1040,8 @@ func (in *LMCacheEngineStatus) DeepCopyInto(out *LMCacheEngineStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
-	if in.NodeLastSeen != nil {
-		in, out := &in.NodeLastSeen, &out.NodeLastSeen
+	if in.NodeAbsentSince != nil {
+		in, out := &in.NodeAbsentSince, &out.NodeAbsentSince
 		*out = make(map[string]metav1.Time, len(*in))
 		for key, val := range *in {
 			(*out)[key] = *val.DeepCopy()
