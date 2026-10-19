@@ -33,6 +33,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
+	"github.com/LMCache/LMCache/internal/placement"
 	"github.com/LMCache/LMCache/internal/resources"
 )
 
@@ -55,6 +56,19 @@ import (
 //
 // Returns (err, done). If done is true the caller must return.
 func (r *LMCacheEngineReconciler) handleFinalizer(ctx context.Context, engine *lmcachev1alpha1.LMCacheEngine) (error, bool) {
+	// Workload-aware engines manage cluster-scoped node labels; ownership
+	// garbage collection cannot clean them, so the finalizer strips them
+	// before the CR is allowed to go away.
+	if engine.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(engine, workloadPlacementFinalizer) {
+		if err := placement.StripAll(ctx, r.Client, engine); err != nil {
+			return err, false
+		}
+		controllerutil.RemoveFinalizer(engine, workloadPlacementFinalizer)
+		if err := r.Update(ctx, engine); err != nil {
+			return err, true
+		}
+	}
+
 	// On the deletion path we still need to clear the legacy finalizer
 	// if a CR created by an older operator version is being deleted,
 	// otherwise K8s would block on it forever.

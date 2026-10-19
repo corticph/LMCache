@@ -16,7 +16,13 @@ limitations under the License.
 
 package resources
 
-import "maps"
+import (
+	"fmt"
+	"hash/fnv"
+	"maps"
+
+	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
+)
 
 // SelectorLabels returns the immutable label subset used for pod selectors.
 func SelectorLabels(name string) map[string]string {
@@ -41,4 +47,36 @@ func MergeLabels(labelMaps ...map[string]string) map[string]string {
 		maps.Copy(result, m)
 	}
 	return result
+}
+
+// workloadLabelPrefix is the node-label prefix the operator manages for
+// workload-aware scheduling. The suffix is a hash of the engine's
+// namespace/name so long CR names cannot overflow the 63-character label key
+// budget and renaming a CR does not strand labels from the old identity.
+const workloadLabelPrefix = "lmcache.ai/wlas-"
+
+// WorkloadLabelValue is the (constant) value of the managed node label.
+const WorkloadLabelValue = "true"
+
+// EffectiveNodeSelector returns the DaemonSet nodeSelector for an engine:
+// spec.nodeSelector alone, or — when workload-aware scheduling is enabled —
+// merged with the managed placement label the operator maintains on nodes
+// hosting matching workload pods. The extra key is what stops the DS
+// controller from creating engine pods on nodes without the workload.
+func EffectiveNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCacheEngineSpec) map[string]string {
+	if w := spec.WorkloadAwareScheduling; w != nil && w.Enabled {
+		key, value := WorkloadPlacementLabel(namespace, name)
+		return MergeLabels(spec.NodeSelector, map[string]string{key: value})
+	}
+	return spec.NodeSelector
+}
+
+// WorkloadPlacementLabel returns the node label key/value pair an
+// LMCacheEngine manages on nodes hosting its matching workload pods. The
+// key embeds an 8-hex fnv64a hash of "namespace/name": deterministic,
+// collision-safe for practical fleet sizes, and terse.
+func WorkloadPlacementLabel(namespace, name string) (key, value string) {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(namespace + "/" + name))
+	return fmt.Sprintf("%s%08x", workloadLabelPrefix, h.Sum64()), WorkloadLabelValue
 }
