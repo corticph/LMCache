@@ -47,9 +47,14 @@ func wlasTestScheme(t *testing.T) *runtime.Scheme {
 	return sc
 }
 
-func newWlasEngine(ns, name string, delaySecs int32) *lmcachev1alpha1.LMCacheEngine {
+// wlasTestNamespace is fixed because every fixture in this suite lives in
+// one namespace; the cross-namespace rejection is exercised by creating a
+// foreign-namespace pod, not by moving the engine.
+const wlasTestNamespace = "mlservices"
+
+func newWlasEngine(name string, delaySecs int32) *lmcachev1alpha1.LMCacheEngine {
 	e := &lmcachev1alpha1.LMCacheEngine{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: wlasTestNamespace},
 	}
 	e.Spec.L1.SizeGB = 8
 	e.Spec.WorkloadAwareScheduling = &lmcachev1alpha1.WorkloadAwareSchedulingSpec{
@@ -114,7 +119,7 @@ func labelSnapshot(ctx context.Context, t *testing.T, c client.Client, key strin
 
 func TestWorkloadPlacement_LabelsNodesHostingBoundPods(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 300)
+	e := newWlasEngine("engine", 300)
 	c := wlasClient(t,
 		e, nodeNamed("gpu-a"), nodeNamed("gpu-b"), nodeNamed("gpu-c"),
 		boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"}),
@@ -145,7 +150,7 @@ func TestWorkloadPlacement_LabelsNodesHostingBoundPods(t *testing.T) {
 
 func TestWorkloadPlacement_KeepsLabelThroughReleaseWindow(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 300)
+	e := newWlasEngine("engine", 300)
 	pod := boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"})
 	c := wlasClient(t, e, nodeNamed("gpu-a"), pod)
 
@@ -184,7 +189,7 @@ func TestWorkloadPlacement_KeepsLabelThroughReleaseWindow(t *testing.T) {
 // actual departure still preserves the workload's full release window.
 func TestWorkloadPlacement_LongGapStillGrantsFullWindow(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 300)
+	e := newWlasEngine("engine", 300)
 	pod := boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"})
 	c := wlasClient(t, e, nodeNamed("gpu-a"), pod)
 
@@ -212,7 +217,7 @@ func TestWorkloadPlacement_LongGapStillGrantsFullWindow(t *testing.T) {
 // instantly — it gets one full release window from its first handling.
 func TestWorkloadPlacement_UntrackedLabelGetsFullWindow(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 300)
+	e := newWlasEngine("engine", 300)
 	key, value := resources.WorkloadPlacementLabel("mlservices", "engine")
 	preLabeled := nodeNamed("gpu-a")
 	preLabeled.Labels[key] = value
@@ -235,7 +240,7 @@ func TestWorkloadPlacement_UntrackedLabelGetsFullWindow(t *testing.T) {
 
 func TestWorkloadPlacement_ZeroDelayRemovesImmediately(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 0)
+	e := newWlasEngine("engine", 0)
 	pod := boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"})
 	c := wlasClient(t, e, nodeNamed("gpu-a"), pod)
 
@@ -254,7 +259,7 @@ func TestWorkloadPlacement_ZeroDelayRemovesImmediately(t *testing.T) {
 
 func TestWorkloadPlacement_DisabledStripsResidue(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 300)
+	e := newWlasEngine("engine", 300)
 	c := wlasClient(t, e, nodeNamed("gpu-a"),
 		boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"}))
 	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
@@ -279,7 +284,7 @@ func TestWorkloadPlacement_DisabledStripsResidue(t *testing.T) {
 
 func TestWorkloadPlacement_IgnoresTerminatingAndTerminalPods(t *testing.T) {
 	ctx := context.Background()
-	e := newWlasEngine("mlservices", "engine", 0)
+	e := newWlasEngine("engine", 0)
 	terminating := boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"})
 	now := metav1.Now()
 	terminating.DeletionTimestamp = &now
@@ -301,8 +306,8 @@ func TestWorkloadPlacement_IgnoresTerminatingAndTerminalPods(t *testing.T) {
 
 func TestStripWorkloadPlacementLabels_PerEngineIsolation(t *testing.T) {
 	ctx := context.Background()
-	e1 := newWlasEngine("mlservices", "engine", 300)
-	e2 := newWlasEngine("mlservices", "engine-2", 300)
+	e1 := newWlasEngine("engine", 300)
+	e2 := newWlasEngine("engine-2", 300)
 	c := wlasClient(t, e1, e2, nodeNamed("gpu-a"), nodeNamed("gpu-b"),
 		boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"}),
 		boundPod("mlservices", "q1", "gpu-b", map[string]string{"app": "predictor"}))
@@ -328,7 +333,7 @@ func TestStripWorkloadPlacementLabels_PerEngineIsolation(t *testing.T) {
 }
 
 func TestWorkloadMatches_MalformedSelectorNeverMatches(t *testing.T) {
-	e := newWlasEngine("mlservices", "engine", 300)
+	e := newWlasEngine("engine", 300)
 	e.Spec.WorkloadAwareScheduling.WorkloadSelector = &metav1.LabelSelector{
 		MatchExpressions: []metav1.LabelSelectorRequirement{
 			{Key: "x", Operator: "BogusOperator", Values: []string{"y"}},

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"time"
 
@@ -38,7 +39,7 @@ import (
 // therefore only exist where the workload runs; a node loses its label — and
 // its engine pod — releaseDelaySeconds after the node is FIRST OBSERVED
 // without the workload. Anchoring the window on observed absence (rather than
-// last-sseen presence) means a controller interruption that misses the actual
+// last-seen presence) means a controller interruption that misses the actual
 // departure still grants the full delay, and a labeled node whose
 // bookkeeping predates this operator gets a full window from its first
 // handling rather than being cleaned up instantly.
@@ -114,31 +115,8 @@ func reconcileWorkloadPlacement(
 ) (time.Duration, error) {
 	key, value := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 
-	// Disabled or never enabled: strip residue from any previous enable and
-	// reset the bookkeeping — only writing status when something changed.
 	if !engine.WorkloadSchedulingEnabled() {
-		if err := purgeWorkloadLabels(ctx, c, key); err != nil {
-			return 0, err
-		}
-		changed := false
-		if engine.Status.NodeAbsentSince != nil {
-			engine.Status.NodeAbsentSince = nil
-			changed = true
-		}
-		if len(engine.Status.WorkloadNodes) > 0 {
-			engine.Status.WorkloadNodes = nil
-			changed = true
-		}
-		if engine.Status.WorkloadLabelKey != "" {
-			engine.Status.WorkloadLabelKey = ""
-			changed = true
-		}
-		if changed {
-			if err := c.Status().Update(ctx, engine); err != nil {
-				return 0, err
-			}
-		}
-		return 0, nil
+		return 0, reconcileWorkloadPlacementOff(ctx, c, engine, key)
 	}
 
 	desired, err := desiredWorkloadNodes(ctx, c, engine)
@@ -150,51 +128,125 @@ func reconcileWorkloadPlacement(
 		desiredSet[n] = struct{}{}
 	}
 
-	// Nodes currently carrying the label.
+	labeled, err := listLabeledNodes(ctx, c, key)
+	if err != nil {
+		return 0, err
+	}
+
+	// Copy-on-write bookkeeping: absence entries are only persisted when a
+	// pass actually changed them, guarding against chronic status churn.
+	absentSince := maps.Clone(engine.Status.NodeAbsentSince)
+	if absentSince == nil {
+		absentSince = map[string]metav1.Time{}
+	}
+
+	// The passes mutate nodes and the absentSince clone; the status write
+	// inside updateWorkloadPlacementStatus is self-guarding — it compares
+	// against engine.Status and persists only when something moved.
+	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, key, value, absentSince); err != nil {
+		return 0, err
+	}
+
+	nextExpiry, err := releaseExpiredWorkloadNodes(ctx, c, labeled, desiredSet, absentSince, engine.WorkloadReleaseDelay(), now, key)
+	if err != nil {
+		return 0, err
+	}
+
+	pruneStaleWorkloadAbsence(absentSince, labeled, desiredSet)
+
+	if err := updateWorkloadPlacementStatus(ctx, c, engine, key, desiredSet, absentSince); err != nil {
+		return 0, err
+	}
+
+	if nextExpiry.IsZero() {
+		return 0, nil
+	}
+	return nextExpiry.Sub(now), nil
+}
+
+// reconcileWorkloadPlacementOff handles a disabled feature: strip residue
+// from any previous enable and reset the bookkeeping, only writing status
+// when something actually changed.
+func reconcileWorkloadPlacementOff(ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine, key string) error {
+	if err := purgeWorkloadLabels(ctx, c, key); err != nil {
+		return err
+	}
+	changed := false
+	if engine.Status.NodeAbsentSince != nil {
+		engine.Status.NodeAbsentSince = nil
+		changed = true
+	}
+	if len(engine.Status.WorkloadNodes) > 0 {
+		engine.Status.WorkloadNodes = nil
+		changed = true
+	}
+	if engine.Status.WorkloadLabelKey != "" {
+		engine.Status.WorkloadLabelKey = ""
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return c.Status().Update(ctx, engine)
+}
+
+// listLabeledNodes returns the nodes currently carrying the managed label.
+func listLabeledNodes(ctx context.Context, c client.Client, key string) (map[string]*corev1.Node, error) {
 	labeled := map[string]*corev1.Node{}
 	nodeList := &corev1.NodeList{}
-	if err := c.List(ctx, nodeList, client.MatchingLabels{key: value}); err != nil {
-		return 0, fmt.Errorf("listing labeled nodes: %w", err)
+	if err := c.List(ctx, nodeList, client.MatchingLabels{key: resources.WorkloadLabelValue}); err != nil {
+		return nil, fmt.Errorf("listing labeled nodes: %w", err)
 	}
 	for i := range nodeList.Items {
 		labeled[nodeList.Items[i].Name] = &nodeList.Items[i]
 	}
+	return labeled, nil
+}
 
-	releaseDelay := engine.WorkloadReleaseDelay()
-	absentSince := engine.Status.NodeAbsentSince
-	if absentSince == nil {
-		absentSince = map[string]metav1.Time{}
-	}
-	statusChanged := false
-
-	// 1) Desired nodes: ensure the label, and clear any absence bookkeeping
-	//    the moment the workload returns.
+// ensureDesiredWorkloadLabels labels every desired node and clears absence
+// bookkeeping the moment the workload returns to a node.
+func ensureDesiredWorkloadLabels(
+	ctx context.Context, c client.Client,
+	labeled map[string]*corev1.Node,
+	desired []string,
+	key, value string,
+	absentSince map[string]metav1.Time,
+) error {
 	for _, node := range desired {
 		if n, ok := labeled[node]; ok {
 			if err := addWorkloadLabel(ctx, c, n, key, value); err != nil {
-				return 0, err
+				return err
 			}
 		} else {
 			fresh := &corev1.Node{}
 			if err := c.Get(ctx, client.ObjectKey{Name: node}, fresh); err != nil {
-				return 0, err
+				return err
 			}
 			if err := addWorkloadLabel(ctx, c, fresh, key, value); err != nil {
-				return 0, err
+				return err
 			}
 		}
-		if _, wasAbsent := absentSince[node]; wasAbsent {
-			delete(absentSince, node)
-			statusChanged = true
-		}
+		delete(absentSince, node)
 	}
+	return nil
+}
 
-	// 2) Labeled nodes without the workload: the release window runs from
-	//    the first reconcile that observes the absence — never from the
-	//    historical last-seen time, so a controller outage crossing the
-	//    actual departure still grants the full delay, and an untracked
-	//    label (from an operator version predating this bookkeeping) gets a
-	//    full window from now instead of an instant cleanup.
+// releaseExpiredWorkloadNodes runs the release windows for labeled nodes the
+// workload has left: the window starts at the first reconcile that observes
+// the absence — never at a historical last-seen time, so a controller outage
+// crossing the actual departure still grants the full delay, and untracked
+// labels (operator predating the bookkeeping) get a full window too. Returns
+// the earliest pending expiry for the caller's requeue.
+func releaseExpiredWorkloadNodes(
+	ctx context.Context,
+	c client.Client,
+	labeled map[string]*corev1.Node,
+	desiredSet map[string]struct{},
+	absentSince map[string]metav1.Time,
+	releaseDelay time.Duration,
+	now time.Time,
+	key string,
+) (time.Time, error) {
 	var nextExpiry time.Time
 	for nodeName, node := range labeled {
 		if _, ok := desiredSet[nodeName]; ok {
@@ -204,7 +256,6 @@ func reconcileWorkloadPlacement(
 		if !tracked {
 			since = metav1.Time{Time: now}
 			absentSince[nodeName] = since
-			statusChanged = true
 		}
 		deadline := since.Add(releaseDelay)
 		if now.Before(deadline) {
@@ -214,24 +265,49 @@ func reconcileWorkloadPlacement(
 			continue // still inside the release window
 		}
 		if err := removeWorkloadLabel(ctx, c, node, key); err != nil {
-			return 0, err
+			return nextExpiry, err
 		}
 		delete(absentSince, nodeName)
-		statusChanged = true
 	}
+	return nextExpiry, nil
+}
 
-	// 3) Bookkeeping hygiene: entries for nodes that are neither labeled nor
-	//    desired (label stripped by other means) are stale.
+// pruneStaleWorkloadAbsence drops bookkeeping for nodes that are neither
+// labeled nor desired (the label was stripped by other means).
+func pruneStaleWorkloadAbsence(
+	absentSince map[string]metav1.Time,
+	labeled map[string]*corev1.Node,
+	desiredSet map[string]struct{},
+) {
 	for nodeName := range absentSince {
 		_, isLabeled := labeled[nodeName]
 		_, isDesired := desiredSet[nodeName]
 		if !isLabeled && !isDesired {
 			delete(absentSince, nodeName)
-			statusChanged = true
 		}
 	}
+}
 
-	// 4) Visible set + status.
+// updateWorkloadPlacementStatus persists the kept bookkeeping and the visible
+// node set. Empty absence maps are written as nil to avoid chronic churn.
+func updateWorkloadPlacementStatus(
+	ctx context.Context,
+	c client.Client,
+	engine *lmcachev1alpha1.LMCacheEngine,
+	key string,
+	desiredSet map[string]struct{},
+	absentSince map[string]metav1.Time,
+) error {
+	changed := false
+	if !timesEqual(absentSince, engine.Status.NodeAbsentSince) {
+		if len(absentSince) > 0 {
+			engine.Status.NodeAbsentSince = absentSince
+		} else {
+			engine.Status.NodeAbsentSince = nil
+		}
+		changed = true
+	}
+
 	visible := make([]string, 0, len(desiredSet)+len(absentSince))
 	for n := range desiredSet {
 		visible = append(visible, n)
@@ -240,34 +316,23 @@ func reconcileWorkloadPlacement(
 		visible = append(visible, n)
 	}
 	sort.Strings(visible)
-
 	if !stringsEqual(visible, engine.Status.WorkloadNodes) {
 		engine.Status.WorkloadNodes = visible
-		statusChanged = true
+		changed = true
 	}
-	if len(absentSince) > 0 {
-		engine.Status.NodeAbsentSince = absentSince
-	} else {
-		engine.Status.NodeAbsentSince = nil // avoid chronic empty-map churn
-	}
+
 	if engine.Status.WorkloadLabelKey != key {
 		engine.Status.WorkloadLabelKey = key
-		statusChanged = true
+		changed = true
 	}
 
-	if statusChanged {
-		if err := c.Status().Update(ctx, engine); err != nil {
-			return 0, err
-		}
+	if !changed {
+		return nil
 	}
-
-	if nextExpiry.IsZero() {
-		return 0, nil
-	}
-	return nextExpiry.Sub(now), nil
+	return c.Status().Update(ctx, engine)
 }
 
-// stripWorkloadplacementLabels removes every node label managed by this
+// stripWorkloadPlacementLabels removes every node label managed by this
 // engine. Called from the CR finalizer: node labels are cluster-scoped, so
 // ownership garbage collection cannot clean them.
 func stripWorkloadPlacementLabels(ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine) error {
@@ -317,6 +382,19 @@ func stringsEqual(a, b []string) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func timesEqual(a, b map[string]metav1.Time) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		ob, ok := b[k]
+		if !ok || !v.Equal(&ob) {
 			return false
 		}
 	}
