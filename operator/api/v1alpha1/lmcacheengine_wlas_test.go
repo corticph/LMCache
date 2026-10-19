@@ -92,6 +92,33 @@ func TestValidate_WorkloadAwareSchedulingAcceptsExpressions(t *testing.T) {
 	}
 }
 
+func TestValidate_WorkloadAwareSchedulingRejectsMalformedSelectors(t *testing.T) {
+	cases := map[string]*metav1.LabelSelector{
+		"unknown-operator": {MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "x", Operator: "Bogus", Values: []string{"y"}},
+		}},
+		"in-needs-values": {MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "x", Operator: metav1.LabelSelectorOpIn},
+		}},
+		"exists-forbids-values": {MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "x", Operator: metav1.LabelSelectorOpExists, Values: []string{"y"}},
+		}},
+		"invalid-label-key": {MatchLabels: map[string]string{"not a valid key": "v"}},
+		"invalid-label-value": {MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "x", Operator: metav1.LabelSelectorOpIn, Values: []string{"not\nvalid"}},
+		}},
+	}
+	for name, sel := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := &LMCacheEngine{Spec: LMCacheEngineSpec{L1: L1BackendSpec{SizeGB: 8}}}
+			e.Spec.WorkloadAwareScheduling = &WorkloadAwareSchedulingSpec{Enabled: true, WorkloadSelector: sel}
+			if errs := e.ValidateSpec(); len(errs) == 0 {
+				t.Fatalf("expected a syntax validation error for %s", name)
+			}
+		})
+	}
+}
+
 func TestSetDefaults_WorkloadAwareReleaseDelay(t *testing.T) {
 	e := &LMCacheEngine{Spec: LMCacheEngineSpec{L1: L1BackendSpec{SizeGB: 8}}}
 	e.Spec.WorkloadAwareScheduling = enabledWAS()

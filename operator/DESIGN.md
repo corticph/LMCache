@@ -477,9 +477,11 @@ Semantics worth knowing:
 - **`releaseDelaySeconds` defaults to 300.** A workload restart on the same
   node (rolling update) keeps the engine and its warm KV cache; a genuine
   departure still cleans up. `0` removes the label on the next reconcile —
-  always clean, but re-rolls rebuild the cache cold. Nodes whose bookkeeping
-  predates the status (older operator) lose their label after the same delay
-  if the workload is absent.
+  always clean, but re-rolls rebuild the cache cold. The window runs from
+  the **first observed absence**, so a controller outage that missed the
+  actual departure still grants the full delay, and a labeled node whose
+  bookkeeping predates this operator gets one full window from its first
+  handling rather than an instant cleanup.
 - **Failure direction.** A node that must be labeled but momentarily cannot be
   fails loudly (requeue). A node that should lose its label but cannot be is
   just retried — sticky engines are the safe side of the asymmetry, and the
@@ -491,7 +493,11 @@ Semantics worth knowing:
   residue immediately.
 - **Status.** `status.workloadLabelKey` names the managed key (for dashboards),
   `status.workloadNodes` the current labeled set, and
-  `status.nodeLastSeen` the internal release-window bookkeeping.
+  `status.nodeAbsentSince` the internal release-window bookkeeping (the
+  release window runs from the **first observed absence** — never from a
+  historical last-seen time — so a controller outage that missed the actual
+  departure still grants the full delay, and an untracked label from an
+  older operator gets a full window from its first handling).
 
 ## Why a node label at all
 

@@ -33,7 +33,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
-	"github.com/LMCache/LMCache/internal/placement"
 	"github.com/LMCache/LMCache/internal/resources"
 )
 
@@ -60,8 +59,11 @@ func (r *LMCacheEngineReconciler) handleFinalizer(ctx context.Context, engine *l
 	// garbage collection cannot clean them, so the finalizer strips them
 	// before the CR is allowed to go away.
 	if engine.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(engine, workloadPlacementFinalizer) {
-		if err := placement.StripAll(ctx, r.Client, engine); err != nil {
-			return err, false
+		if err := stripWorkloadPlacementLabels(ctx, r.Client, engine); err != nil {
+			// done=true: stop reconciling a deleting CR. Continuing could
+			// re-add labels removed during a partial cleanup, and returning
+			// the error is what schedules the retry.
+			return err, true
 		}
 		controllerutil.RemoveFinalizer(engine, workloadPlacementFinalizer)
 		if err := r.Update(ctx, engine); err != nil {
