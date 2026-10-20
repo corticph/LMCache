@@ -18,15 +18,18 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
 	"github.com/LMCache/LMCache/internal/resources"
@@ -43,6 +46,11 @@ import (
 // departure still grants the full delay, and a labeled node whose
 // bookkeeping predates this operator gets a full window from its first
 // handling rather than being cleaned up instantly.
+
+// removalRetryDelay backs the requeue scheduled when an expired label
+// cannot be removed (sticky-engine path): quick enough to converge a
+// transient node-patch failure, far enough not to spin.
+const removalRetryDelay = 30 * time.Second
 
 // workloadSelectorFor parses spec.workloadAwareScheduling.workloadSelector.
 // Malformed selectors error here; the validating webhook rejects them at
@@ -140,17 +148,11 @@ func reconcileWorkloadPlacement(
 		absentSince = map[string]metav1.Time{}
 	}
 
-	// The passes mutate nodes and the absentSince clone; the status write
-	// inside updateWorkloadPlacementStatus is self-guarding — it compares
-	// against engine.Status and persists only when something moved.
-	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, key, value, absentSince); err != nil {
+	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, desiredSet, key, value, absentSince); err != nil {
 		return 0, err
 	}
 
-	nextExpiry, err := releaseExpiredWorkloadNodes(ctx, c, labeled, desiredSet, absentSince, engine.WorkloadReleaseDelay(), now, key)
-	if err != nil {
-		return 0, err
-	}
+	nextExpiry := releaseExpiredWorkloadNodes(ctx, c, labeled, desiredSet, absentSince, engine.WorkloadReleaseDelay(), now, key)
 
 	pruneStaleWorkloadAbsence(absentSince, labeled, desiredSet)
 
@@ -205,30 +207,43 @@ func listLabeledNodes(ctx context.Context, c client.Client, key string) (map[str
 
 // ensureDesiredWorkloadLabels labels every desired node and clears absence
 // bookkeeping the moment the workload returns to a node.
+//
+// Add failures are collected per node rather than returned eagerly so one
+// stuck node does not prevent labeling the others; the joined error is
+// returned once the pass completes — loud, with total progress. A Get
+// NotFound is skipped rather than failed: a pod can be bound to a node that
+// was just deleted before pod GC catches up, and that transient must not
+// wedge the whole reconcile.
 func ensureDesiredWorkloadLabels(
 	ctx context.Context, c client.Client,
 	labeled map[string]*corev1.Node,
 	desired []string,
+	desiredSet map[string]struct{},
 	key, value string,
 	absentSince map[string]metav1.Time,
 ) error {
+	var errs []error
 	for _, node := range desired {
 		if n, ok := labeled[node]; ok {
-			if err := addWorkloadLabel(ctx, c, n, key, value); err != nil {
-				return err
-			}
+			errs = append(errs, addWorkloadLabel(ctx, c, n, key, value))
 		} else {
 			fresh := &corev1.Node{}
 			if err := c.Get(ctx, client.ObjectKey{Name: node}, fresh); err != nil {
-				return err
+				if apierrors.IsNotFound(err) {
+					// Pod bound to a deleted node (pre-GC race): drop the
+					// entry from the visible set too; pod GC will remove
+					// the stale pod from the next desired listing.
+					delete(desiredSet, node)
+					continue
+				}
+				errs = append(errs, err)
+				continue
 			}
-			if err := addWorkloadLabel(ctx, c, fresh, key, value); err != nil {
-				return err
-			}
+			errs = append(errs, addWorkloadLabel(ctx, c, fresh, key, value))
 		}
 		delete(absentSince, node)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // releaseExpiredWorkloadNodes runs the release windows for labeled nodes the
@@ -246,8 +261,15 @@ func releaseExpiredWorkloadNodes(
 	releaseDelay time.Duration,
 	now time.Time,
 	key string,
-) (time.Time, error) {
+) time.Time {
+	// Removal failures are logged, not returned: a node that must lose its
+	// label but cannot is the sticky-engine side of the asymmetry — the
+	// safe side — and returning the error would block DaemonSet, Service,
+	// ConfigMap and status reconciliation for the whole engine on a stuck
+	// node patch. The scheduled requeue retries failed removals while the
+	// label (and its engine pod) simply stays.
 	var nextExpiry time.Time
+	var removeRetry time.Time
 	for nodeName, node := range labeled {
 		if _, ok := desiredSet[nodeName]; ok {
 			continue
@@ -265,11 +287,22 @@ func releaseExpiredWorkloadNodes(
 			continue // still inside the release window
 		}
 		if err := removeWorkloadLabel(ctx, c, node, key); err != nil {
-			return nextExpiry, err
+			if apierrors.IsNotFound(err) {
+				delete(absentSince, nodeName) // node object is gone; nothing to remove
+				continue
+			}
+			log.FromContext(ctx).Error(err, "failed to remove workload label; retrying next reconcile", "node", nodeName)
+			if removeRetry.IsZero() {
+				removeRetry = now.Add(removalRetryDelay)
+			}
+			continue
 		}
 		delete(absentSince, nodeName)
 	}
-	return nextExpiry, nil
+	if nextExpiry.IsZero() || (!removeRetry.IsZero() && removeRetry.Before(nextExpiry)) {
+		return removeRetry
+	}
+	return nextExpiry
 }
 
 // pruneStaleWorkloadAbsence drops bookkeeping for nodes that are neither

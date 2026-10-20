@@ -62,11 +62,17 @@ func (e *LMCacheEngine) SetDefaults() {
 // genuine workload departure.
 const defaultReleaseDelaySeconds = 300
 
-// WorkloadReleaseDelay returns the effective workload-aware release delay,
-// zero when the feature is disabled. Meaningful only after SetDefaults has
-// filled the omitted pointer.
+// WorkloadReleaseDelay returns the effective workload-aware release delay
+// for an enabled engine, zero when the feature is disabled. A nil
+// ReleaseDelaySeconds falls back to defaultReleaseDelaySeconds rather than
+// silently collapsing to 0: API-created objects get the CRD default, but an
+// in-memory path that skipped SetDefaults must not land on the
+// "always rebuild cold" behavior by accident.
 func (e *LMCacheEngine) WorkloadReleaseDelay() time.Duration {
-	if w := e.Spec.WorkloadAwareScheduling; w != nil && w.Enabled && w.ReleaseDelaySeconds != nil {
+	if w := e.Spec.WorkloadAwareScheduling; w != nil && w.Enabled {
+		if w.ReleaseDelaySeconds == nil {
+			return time.Duration(defaultReleaseDelaySeconds) * time.Second
+		}
 		return time.Duration(*w.ReleaseDelaySeconds) * time.Second
 	}
 	return 0
