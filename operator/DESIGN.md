@@ -425,7 +425,7 @@ reach (Redis L2 keys, federation deregistration, etc.).
 
 ## Workload-Aware Placement (`spec.workloadAwareScheduling`)
 
-## The problem
+### The problem
 
 The engine DaemonSet is created on every node matching `spec.nodeSelector`,
 and co-location with the workload is enforced by a *required* pod affinity
@@ -443,7 +443,7 @@ known warts:
 Both have the same root cause: the DaemonSet placement does not know where
 the workload actually runs.
 
-## The feature
+### The feature
 
 ```yaml
 spec:
@@ -486,20 +486,40 @@ Semantics worth knowing:
   fails loudly (requeue). A node that should lose its label but cannot be is
   just retried — sticky engines are the safe side of the asymmetry, and the
   only side affinity-only placement ever had.
+- **Toggling rolls engine pods once.** Changing `enabled` changes the
+  DaemonSet pod template (the managed nodeSelector key appears/disappears),
+  so the DaemonSet controller performs one rolling update of all engine
+  pods — including the ones on nodes that keep their workload. CRs that
+  never enable the feature are byte-for-byte previous behavior; whether on
+  or off, the toggle itself is not cache-preserving.
+- **Disable ordering is enforced, not merely sequenced.** On the disabling
+  path the reconcile re-reads the live DaemonSet after updating it and
+  refuses to purge node labels while its nodeSelector still references the
+  managed key — so no watch race or partial reconcile can produce the
+  "selector points at a label no node carries" state that would delete
+  every engine pod. Cleanup therefore always lands after the operator
+  DaemonSet has accepted the label-free selector.
+- **Node watch.** A node losing its managed label (by anything other than
+  the operator) is repaired on the next reconcile of the owning engines;
+  the operator re-watches nodes for managed-prefix label changes so that
+  repair happens immediately instead of on the next pod event.
 - **Deletion.** Node labels are cluster-scoped, so ownership garbage
   collection cannot clean them. While enabled, the CR carries the
   `lmcache.ai/workload-placement-cleanup` finalizer; deletion first strips
   every managed label, then proceeds. Disabling the feature also strips
-  residue immediately.
-- **Status.** `status.workloadLabelKey` names the managed key (for dashboards),
-  `status.workloadNodes` the current labeled set, and
-  `status.nodeAbsentSince` the internal release-window bookkeeping (the
-  release window runs from the **first observed absence** — never from a
-  historical last-seen time — so a controller outage that missed the actual
-  departure still grants the full delay, and an untracked label from an
-  older operator gets a full window from its first handling).
+  residue immediately (after the label-free selector has landed, per the
+  ordering note above).
+- **RBAC footprint.** The controller needs `nodes: get, list, watch, patch`.
+  Cluster-scoped `nodes: patch` cannot be narrowed by RBAC to label keys
+  only — clusters that care can add a ValidatingAdmissionPolicy restricting
+  the operator's service account to label changes on the
+  `lmcache.ai/wlas-` prefix. The controller also holds a Pod watch
+  (cluster-wide; placement-mapped per event) and a Node watch filtered to
+  managed-label changes — on clusters with many pods, the Pod informer
+  carries the usual memory cost of caching every pod in the cluster.
+- **Status.** `status.workloadLabelKey` names the managed key (for dashboards), `status.workloadNodes` the current labeled set, and `status.nodeAbsentSince` the release-window bookkeeping (see `releaseDelaySeconds` above for the first-observed-absence semantics).
 
-## Why a node label at all
+### Why a node label at all
 
 A DaemonSet's nodeSelector is the only variable that decides *where DS pods
 are created*, and it only reads node labels. Required pod affinity cannot
@@ -509,10 +529,12 @@ bridge available without changing the engine's object form.
 
 ## Validation
 
-`workloadSelector` is required when enabled, and must be non-empty: an empty
-`LabelSelector` matches every pod, and one malformed CR would label every
-node running anything in the namespace. When unset, validation also accepts
-nothing else — the selector must be provided explicitly.
+`workloadSelector` is required when enabled, and must be non-empty and
+syntactically valid: an empty `LabelSelector` matches every pod (one
+malformed CR would label every node running anything in the namespace),
+and unknown operators or `In`-without-values reject at admission via
+upstream `LabelSelector` syntax validation rather than failing per-event
+in the controller.
 
 ---
 

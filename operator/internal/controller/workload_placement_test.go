@@ -346,3 +346,88 @@ func TestWorkloadMatches_MalformedSelectorNeverMatches(t *testing.T) {
 		t.Fatal("malformed selector must not match anything")
 	}
 }
+
+// Strengthened per review: the long-gap regression must exercise stale
+// PRE-GAP absence bookkeeping, not just a gap from a never-absent state.
+// An absence window observed BEFORE a controller outage must be honored
+// exactly — expired across the gap → removed; within its window across the
+// gap → kept. The window never restarts.
+func TestWorkloadPlacement_PreGapAbsenceEntryHonoredAcrossGap(t *testing.T) {
+	ctx := context.Background()
+
+	// Expired-entry case: absence observed at t0-400 (releaseDelay 300 →
+	// deadline t0-100), controller resumes only at t0 → the label must be
+	// removed. First-observed-absence never re-grants once entries exist.
+	t.Run("expired pre-gap entry is removed on resume", func(t *testing.T) {
+		e := newWlasEngine("engine", 300)
+		key, value := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+		pre := nodeNamed("gpu-a")
+		pre.Labels[key] = value
+		c := wlasClient(t, e, pre) // no matching pods; label pre-seeded
+
+		gapStart := time.Now().Add(-400 * time.Second)
+		e.Status.NodeAbsentSince = map[string]metav1.Time{"gpu-a": {Time: gapStart}}
+		if err := c.Status().Update(t.Context(), e); err != nil {
+			t.Fatal(err)
+		}
+		mustPlacementReconcile(ctx, t, c, e, gapStart.Add(400*time.Second))
+		if got := labelSnapshot(ctx, t, c, key); got["gpu-a"] {
+			t.Fatal("an absence entry 100s past its deadline must release on the next observation, not re-grant a window")
+		}
+	})
+
+	// Within-window case: absence observed at t0-60 with delay 300 →
+	// controller out until t0+60 (i.e., 120s into the window) → kept,
+	// honoring the pre-gap observation, full window never restarted.
+	t.Run("in-window pre-gap entry survives and keeps its window", func(t *testing.T) {
+		e := newWlasEngine("engine", 300)
+		key, value := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+		pre := nodeNamed("gpu-a")
+		pre.Labels[key] = value
+		c := wlasClient(t, e, pre)
+
+		gapStart := time.Now().Add(-60 * time.Second)
+		e.Status.NodeAbsentSince = map[string]metav1.Time{"gpu-a": {Time: gapStart}}
+		if err := c.Status().Update(t.Context(), e); err != nil {
+			t.Fatal(err)
+		}
+		delay := mustPlacementReconcile(ctx, t, c, e, gapStart.Add(120*time.Second))
+		if got := labelSnapshot(ctx, t, c, key); !got["gpu-a"] {
+			t.Fatal("the pre-gap window must still be in force")
+		}
+		// metav1.Time round-trips through status with second precision,
+		// so the remaining window is 180s minus a sub-second remainder.
+		if delay > 180*time.Second || delay < 179*time.Second {
+			t.Fatalf("the pre-gap window must continue from its own start (~180s remaining), got %v", delay)
+		}
+	})
+}
+
+// NotFound on the add path: a desired node whose object is already gone
+// (pod bound to a node that was just deleted before pod GC) must be SKIPPED,
+// not returned as an error — otherwise a pre-GC pod wedges the whole
+// reconcile (DaemonSet, Services, status) on a stale spec.nodeName.
+func TestWorkloadPlacement_DesiredNodeNotFoundIsSkipped(t *testing.T) {
+	ctx := context.Background()
+	e := newWlasEngine("engine", 300)
+	// p1 bound to a healthy node; p2 bound to a node that does not exist.
+	c := wlasClient(t, e, nodeNamed("gpu-a"),
+		boundPod(wlasTestNamespace, "p1", "gpu-a", map[string]string{"app": "predictor"}),
+		boundPod(wlasTestNamespace, "p2", "gpu-ghost", map[string]string{"app": "predictor"}))
+	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+
+	if _, err := reconcileWorkloadPlacement(ctx, c, e, time.Now()); err != nil {
+		t.Fatalf("missing node object must be skipped, not fail the reconcile: %v", err)
+	}
+	// The healthy node still got labeled (the bad node didn't block it).
+	if got := labelSnapshot(ctx, t, c, key); !got["gpu-a"] {
+		t.Fatal("a NotFound on one desired node must not block labeling the others")
+	}
+	// The ghost node must not have created a status entry.
+	if _, ghost := e.Status.NodeAbsentSince["gpu-ghost"]; ghost {
+		t.Fatal("skipped node must not carry absence bookkeeping")
+	}
+	if len(e.Status.WorkloadNodes) != 1 || e.Status.WorkloadNodes[0] != "gpu-a" {
+		t.Fatalf("workloadNodes must contain only reachable nodes: %v", e.Status.WorkloadNodes)
+	}
+}

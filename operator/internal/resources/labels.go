@@ -49,11 +49,13 @@ func MergeLabels(labelMaps ...map[string]string) map[string]string {
 	return result
 }
 
-// workloadLabelPrefix is the node-label prefix the operator manages for
-// workload-aware scheduling. The suffix is a hash of the engine's
-// namespace/name so long CR names cannot overflow the 63-character label key
-// budget and renaming a CR does not strand labels from the old identity.
-const workloadLabelPrefix = "lmcache.ai/wlas-"
+// WorkloadLabelPrefix is the node-label prefix the operator manages for
+// workload-aware scheduling. The suffix is the hexadecimal encoding of an
+// fnv64a hash of the engine's "namespace/name": keys stay inside the
+// 63-character label budget regardless of CR name length, and the mapping
+// is stable for the lifetime of the CR. Exported for the controller's node
+// watch predicate, which acts on any label carrying this prefix.
+const WorkloadLabelPrefix = "lmcache.ai/wlas-"
 
 // WorkloadLabelValue is the (constant) value of the managed node label.
 const WorkloadLabelValue = "true"
@@ -78,5 +80,5 @@ func EffectiveNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCache
 func WorkloadPlacementLabel(namespace, name string) (key, value string) {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(namespace + "/" + name))
-	return fmt.Sprintf("%s%08x", workloadLabelPrefix, h.Sum64()), WorkloadLabelValue
+	return fmt.Sprintf("%s%x", WorkloadLabelPrefix, h.Sum64()), WorkloadLabelValue
 }
