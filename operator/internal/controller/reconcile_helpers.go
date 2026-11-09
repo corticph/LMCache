@@ -221,7 +221,18 @@ func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(ctx context.Context, e
 		if err := ctrl.SetControllerReference(engine, desired, r.Scheme); err != nil {
 			return err
 		}
-		if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
+		err := r.Create(ctx, desired)
+		switch {
+		case err == nil:
+		case apierrors.IsAlreadyExists(err):
+			// The name is taken but not by us (the ownerRef-filtered
+			// `owned` map missed it) — e.g. another engine's base DS
+			// named "s1-2x". This tier's nodes would silently run
+			// without a scaled engine, so fail loudly instead.
+			return fmt.Errorf(
+				"cannot create tier DaemonSet %s: a DaemonSet with this name exists and is not owned by engine %s/%s",
+				desired.Name, engine.Namespace, engine.Name)
+		default:
 			return err
 		}
 	}
