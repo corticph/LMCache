@@ -54,13 +54,10 @@ func workloadAwareEngine() *lmcachev1alpha1.LMCacheEngine {
 // change, or every already-labeled node's key would be orphaned on operator
 // upgrade (the DaemonSet would start selecting a label no node carries).
 func TestWorkloadPlacementLabelPinned(t *testing.T) {
-	key, value := WorkloadPlacementLabel("mlservices", "my-engine")
+	key := WorkloadPlacementLabel("mlservices", "my-engine")
 	const want = "lmcache.ai/wlas-" + "ab3bc0b93e3a551c" // fnv64a("mlservices/my-engine"), hex
 	if key != want {
 		t.Fatalf("label key = %q, want %q — hash function changed, labels orphaned on upgrade!", key, want)
-	}
-	if value != WorkloadLabelValueBase {
-		t.Fatalf("label value = %q, want %q", value, WorkloadLabelValueBase)
 	}
 	if len(key) > 63 {
 		t.Fatalf("label key %q exceeds the 63-character label key budget", key)
@@ -70,9 +67,9 @@ func TestWorkloadPlacementLabelPinned(t *testing.T) {
 // TestWorkloadPlacementLabelDistinct asserts per-identity keys: two engines
 // must never share one key or they would fight over each other's nodes.
 func TestWorkloadPlacementLabelDistinct(t *testing.T) {
-	k1, _ := WorkloadPlacementLabel("mlservices", "engine-a")
-	k2, _ := WorkloadPlacementLabel("mlservices", "engine-b")
-	k3, _ := WorkloadPlacementLabel("other-ns", "engine-a")
+	k1 := WorkloadPlacementLabel("mlservices", "engine-a")
+	k2 := WorkloadPlacementLabel("mlservices", "engine-b")
+	k3 := WorkloadPlacementLabel("other-ns", "engine-a")
 	if k1 == k2 || k1 == k3 || k2 == k3 {
 		t.Fatalf("expected distinct labels, got %q / %q / %q", k1, k2, k3)
 	}
@@ -82,7 +79,7 @@ func TestWorkloadPlacementLabelDistinct(t *testing.T) {
 // survives pathological CR names.
 func TestWorkloadPlacementLabelLongNameStaysInBudget(t *testing.T) {
 	long := "an-extremely-long-engine-name-that-would-overflow-any-name-derived-key-scheme-if-we-used-one-aaaa"
-	key, _ := WorkloadPlacementLabel("very-long-namespace-name-to-be-safe", long)
+	key := WorkloadPlacementLabel("very-long-namespace-name-to-be-safe", long)
 	if len(key) > 63 {
 		t.Fatalf("hash-derived key %q exceeded budget (%d)", key, len(key))
 	}
@@ -118,7 +115,7 @@ func TestEffectiveNodeSelector_EnabledMergesAddedKey(t *testing.T) {
 	engine := workloadAwareEngine()
 	engine.Spec.NodeSelector = map[string]string{"workload": "gpu-h100", "gpu-type": "h100"}
 	got := EffectiveNodeSelector(wlLabelTestNS, engine.Name, &engine.Spec)
-	key, _ := WorkloadPlacementLabel("mlservices", "engine")
+	key := WorkloadPlacementLabel("mlservices", "engine")
 	if got["workload"] != testNodeSelectorValue || got["gpu-type"] != "h100" {
 		t.Fatalf("user nodeSelector must survive the merge: %v", got)
 	}
@@ -135,7 +132,7 @@ func TestEffectiveNodeSelector_EnabledMergesAddedKey(t *testing.T) {
 func TestEffectiveNodeSelector_EnabledEmptyUserSelector(t *testing.T) {
 	engine := workloadAwareEngine()
 	got := EffectiveNodeSelector(wlLabelTestNS, engine.Name, &engine.Spec)
-	key, _ := WorkloadPlacementLabel("mlservices", "engine")
+	key := WorkloadPlacementLabel("mlservices", "engine")
 	if got[key] != WorkloadLabelValueBase {
 		t.Fatalf("managed label missing on empty user selector: %v", got)
 	}

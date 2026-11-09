@@ -195,10 +195,7 @@ func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(ctx context.Context, e
 	); err != nil {
 		return err
 	}
-	owned, err := ownedTierDaemonSets(list.Items, engine)
-	if err != nil {
-		return err
-	}
+	owned := ownedTierDaemonSets(list.Items, engine)
 
 	activeTiers, err := r.activeTiers(ctx, engine)
 	if err != nil {
@@ -254,7 +251,7 @@ func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(ctx context.Context, e
 // ownedTierDaemonSets filters DaemonSets to those controlled by the
 // engine AND carrying the tier template label with a non-base value
 // (the base DS has no tier label).
-func ownedTierDaemonSets(items []appsv1.DaemonSet, engine *lmcachev1alpha1.LMCacheEngine) (map[string]*appsv1.DaemonSet, error) {
+func ownedTierDaemonSets(items []appsv1.DaemonSet, engine *lmcachev1alpha1.LMCacheEngine) map[string]*appsv1.DaemonSet {
 	owned := map[string]*appsv1.DaemonSet{}
 	for i := range items {
 		ds := &items[i]
@@ -267,7 +264,7 @@ func ownedTierDaemonSets(items []appsv1.DaemonSet, engine *lmcachev1alpha1.LMCac
 		}
 		owned[ds.Name] = ds
 	}
-	return owned, nil
+	return owned
 }
 
 // activeTiers returns the distinct tier multipliers among the nodes the
@@ -278,7 +275,7 @@ func (r *LMCacheEngineReconciler) activeTiers(ctx context.Context, engine *lmcac
 	if !engine.DynamicResourceAllocationEnabled() {
 		return tiers, nil
 	}
-	key, _ := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
+	key := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 	labeled, err := listLabeledNodes(ctx, r.Client, key)
 	if err != nil {
 		return nil, err

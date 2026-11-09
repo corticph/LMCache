@@ -128,7 +128,7 @@ func matchingWorkloadPods(ctx context.Context, c client.Client, engine *lmcachev
 func reconcileWorkloadPlacement(
 	ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine, now time.Time,
 ) (time.Duration, error) {
-	key, _ := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
+	key := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 
 	if !engine.WorkloadSchedulingEnabled() {
 		return 0, reconcileWorkloadPlacementOff(ctx, c, engine, key)
@@ -159,12 +159,12 @@ func reconcileWorkloadPlacement(
 	if absentSince == nil {
 		absentSince = map[string]metav1.Time{}
 	}
-	tierChangeSince := maps.Clone(engine.Status.NodeTierChangeSince)
-	if tierChangeSince == nil {
-		tierChangeSince = map[string]metav1.Time{}
+	tierChanges := maps.Clone(engine.Status.NodeTierChanges)
+	if tierChanges == nil {
+		tierChanges = map[string]lmcachev1alpha1.NodeTierChange{}
 	}
 
-	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, desiredSet, key, tiers, absentSince, tierChangeSince, now, engine); err != nil {
+	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, desiredSet, key, tiers, absentSince, tierChanges, now, engine); err != nil {
 		return 0, err
 	}
 
@@ -172,16 +172,16 @@ func reconcileWorkloadPlacement(
 	// Tier-change bookkeeping dies with the release.
 	for nodeName := range labeled {
 		if _, ok := desiredSet[nodeName]; !ok {
-			delete(tierChangeSince, nodeName)
+			delete(tierChanges, nodeName)
 		}
 	}
 
 	pruneStaleWorkloadAbsence(absentSince, labeled, desiredSet)
-	pruneStaleTierChanges(tierChangeSince, labeled, desiredSet)
+	pruneStaleTierChanges(tierChanges, labeled, desiredSet)
 
-	nextTierApply := nextTierChange(tierChangeSince, engine, now)
+	nextTierApply := nextTierChange(tierChanges, engine, now)
 
-	if err := updateWorkloadPlacementStatus(ctx, c, engine, key, desiredSet, absentSince, tierChangeSince); err != nil {
+	if err := updateWorkloadPlacementStatus(ctx, c, engine, key, desiredSet, absentSince, tierChanges); err != nil {
 		return 0, err
 	}
 
@@ -251,15 +251,15 @@ func computeNodeTiers(engine *lmcachev1alpha1.LMCacheEngine, pods []*corev1.Pod)
 
 // nextTierChange returns the earliest pending tier-change application
 // deadline (zero when none), for the caller's requeue.
-func nextTierChange(tierChangeSince map[string]metav1.Time, engine *lmcachev1alpha1.LMCacheEngine, now time.Time) time.Time {
+func nextTierChange(tierChanges map[string]lmcachev1alpha1.NodeTierChange, engine *lmcachev1alpha1.LMCacheEngine, now time.Time) time.Time {
 	dra := engine.Spec.WorkloadAwareScheduling.DynamicResourceAllocation
 	if dra == nil || !dra.Enabled {
 		return time.Time{}
 	}
 	delay := dra.EffectiveDRATierChangeDelay()
 	var next time.Time
-	for _, since := range tierChangeSince {
-		deadline := since.Add(delay)
+	for _, pending := range tierChanges {
+		deadline := pending.Since.Add(delay)
 		if now.Before(deadline) && (next.IsZero() || deadline.Before(next)) {
 			next = deadline
 		}
@@ -270,15 +270,15 @@ func nextTierChange(tierChangeSince map[string]metav1.Time, engine *lmcachev1alp
 // pruneStaleTierChanges drops tier-change bookkeeping for nodes that are
 // neither labeled nor desired.
 func pruneStaleTierChanges(
-	tierChangeSince map[string]metav1.Time,
+	tierChanges map[string]lmcachev1alpha1.NodeTierChange,
 	labeled map[string]*corev1.Node,
 	desiredSet map[string]struct{},
 ) {
-	for nodeName := range tierChangeSince {
+	for nodeName := range tierChanges {
 		_, isLabeled := labeled[nodeName]
 		_, isDesired := desiredSet[nodeName]
 		if !isLabeled && !isDesired {
-			delete(tierChangeSince, nodeName)
+			delete(tierChanges, nodeName)
 		}
 	}
 }
@@ -309,8 +309,8 @@ func reconcileWorkloadPlacementOff(ctx context.Context, c client.Client, engine 
 		engine.Status.NodeAbsentSince = nil
 		changed = true
 	}
-	if engine.Status.NodeTierChangeSince != nil {
-		engine.Status.NodeTierChangeSince = nil
+	if engine.Status.NodeTierChanges != nil {
+		engine.Status.NodeTierChanges = nil
 		changed = true
 	}
 	if len(engine.Status.WorkloadNodes) > 0 {
@@ -329,15 +329,10 @@ func reconcileWorkloadPlacementOff(ctx context.Context, c client.Client, engine 
 
 // listLabeledNodes returns the nodes currently carrying the managed label
 // (any value: with dynamic resource allocation the value is the node's
-// tier multiplier).
+// tier multiplier). A key-presence scan, not a value match, because the
+// label value varies ("1", "2", ...) once dynamic resource allocation
+// is enabled.
 func listLabeledNodes(ctx context.Context, c client.Client, key string) (map[string]*corev1.Node, error) {
-	return nodesCarryingLabel(ctx, c, key)
-}
-
-// nodesCarryingLabel lists all nodes and keeps those carrying the key —
-// a key-presence scan, not a value match, because the label value varies
-// ("1", "2", ...) once dynamic resource allocation is enabled.
-func nodesCarryingLabel(ctx context.Context, c client.Client, key string) (map[string]*corev1.Node, error) {
 	nodeList := &corev1.NodeList{}
 	if err := c.List(ctx, nodeList); err != nil {
 		return nil, fmt.Errorf("listing nodes: %w", err)
@@ -377,7 +372,7 @@ func ensureDesiredWorkloadLabels(
 	key string,
 	tiers map[string]int32,
 	absentSince map[string]metav1.Time,
-	tierChangeSince map[string]metav1.Time,
+	tierChanges map[string]lmcachev1alpha1.NodeTierChange,
 	now time.Time,
 	engine *lmcachev1alpha1.LMCacheEngine,
 ) error {
@@ -390,8 +385,10 @@ func ensureDesiredWorkloadLabels(
 	var errs []error
 	for _, node := range desired {
 		value := resources.WorkloadLabelValueBase
+		targetTier := int32(1)
 		if tier, ok := tiers[node]; ok {
 			value = resources.TierLabelValue(tier)
+			targetTier = tier
 		}
 
 		var target *corev1.Node
@@ -415,7 +412,7 @@ func ensureDesiredWorkloadLabels(
 
 		if target.Labels[key] == value {
 			// Already at the desired tier: any pending change is moot.
-			delete(tierChangeSince, node)
+			delete(tierChanges, node)
 			delete(absentSince, node)
 			continue
 		}
@@ -423,7 +420,7 @@ func ensureDesiredWorkloadLabels(
 			// First placement — label immediately.
 			errs = append(errs, addWorkloadLabel(ctx, c, target, key, value))
 			delete(absentSince, node)
-			delete(tierChangeSince, node)
+			delete(tierChanges, node)
 			continue
 		}
 		// Labeled at a different tier: apply after the hysteresis window.
@@ -432,21 +429,24 @@ func ensureDesiredWorkloadLabels(
 		// or the base DS ("1") would not match the node during the wait.
 		if current, ok := target.Labels[key]; ok && current != "" && !isNumericLabel(current) {
 			errs = append(errs, addWorkloadLabel(ctx, c, target, key, value))
-			delete(tierChangeSince, node)
+			delete(tierChanges, node)
 			delete(absentSince, node)
 			continue
 		}
-		since, tracked := tierChangeSince[node]
-		if !tracked {
-			since = metav1.Time{Time: now}
-			tierChangeSince[node] = since
+		// The window is anchored on the TARGET tier: a changed target
+		// (1->2 aging out, then the sum moves to 3) restarts the window
+		// so 3 is never applied on 2's stale timestamp.
+		pending, tracked := tierChanges[node]
+		if !tracked || pending.Tier != targetTier {
+			pending = lmcachev1alpha1.NodeTierChange{Tier: targetTier, Since: metav1.Time{Time: now}}
+			tierChanges[node] = pending
 		}
-		if now.Before(since.Add(tierDelay)) {
+		if now.Before(pending.Since.Add(tierDelay)) {
 			delete(absentSince, node)
 			continue // still inside the tier-change window
 		}
 		errs = append(errs, addWorkloadLabel(ctx, c, target, key, value))
-		delete(tierChangeSince, node)
+		delete(tierChanges, node)
 		delete(absentSince, node)
 	}
 	return errors.Join(errs...)
@@ -536,7 +536,7 @@ func updateWorkloadPlacementStatus(
 	key string,
 	desiredSet map[string]struct{},
 	absentSince map[string]metav1.Time,
-	tierChangeSince map[string]metav1.Time,
+	tierChanges map[string]lmcachev1alpha1.NodeTierChange,
 ) error {
 	changed := false
 	if !timesEqual(absentSince, engine.Status.NodeAbsentSince) {
@@ -547,11 +547,11 @@ func updateWorkloadPlacementStatus(
 		}
 		changed = true
 	}
-	if !timesEqual(tierChangeSince, engine.Status.NodeTierChangeSince) {
-		if len(tierChangeSince) > 0 {
-			engine.Status.NodeTierChangeSince = tierChangeSince
+	if !tierChangesEqual(tierChanges, engine.Status.NodeTierChanges) {
+		if len(tierChanges) > 0 {
+			engine.Status.NodeTierChanges = tierChanges
 		} else {
-			engine.Status.NodeTierChangeSince = nil
+			engine.Status.NodeTierChanges = nil
 		}
 		changed = true
 	}
@@ -584,12 +584,12 @@ func updateWorkloadPlacementStatus(
 // engine. Called from the CR finalizer: node labels are cluster-scoped, so
 // ownership garbage collection cannot clean them.
 func stripWorkloadPlacementLabels(ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine) error {
-	key, _ := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
+	key := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 	return purgeWorkloadLabels(ctx, c, key)
 }
 
 func purgeWorkloadLabels(ctx context.Context, c client.Client, key string) error {
-	nodes, err := nodesCarryingLabel(ctx, c, key)
+	nodes, err := listLabeledNodes(ctx, c, key)
 	if err != nil {
 		return err
 	}
@@ -659,6 +659,21 @@ func isNumericLabel(v string) bool {
 	}
 	for _, r := range v {
 		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// tierChangesEqual compares two pending-tier bookkeeping maps; guards
+// status writes against no-op churn (mirrors timesEqual).
+func tierChangesEqual(a, b map[string]lmcachev1alpha1.NodeTierChange) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		ob, ok := b[k]
+		if !ok || v.Tier != ob.Tier || !v.Since.Equal(&ob.Since) {
 			return false
 		}
 	}

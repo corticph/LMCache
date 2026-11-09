@@ -134,7 +134,7 @@ func TestWorkloadPlacement_LabelsNodesHostingBoundPods(t *testing.T) {
 
 	mustPlacementReconcile(ctx, t, c, e, time.Now())
 
-	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 	got := labelSnapshot(ctx, t, c, key)
 	want := map[string]bool{"gpu-a": true, "gpu-b": true}
 	if diff := cmp.Diff(want, got); diff != "" {
@@ -156,7 +156,7 @@ func TestWorkloadPlacement_KeepsLabelThroughReleaseWindow(t *testing.T) {
 
 	t0 := time.Now()
 	mustPlacementReconcile(ctx, t, c, e, t0)
-	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 
 	// Workload leaves; first absence is observed 60s in. The release window
 	// starts at THIS observation, so a full 300s window remains — that is
@@ -206,7 +206,7 @@ func TestWorkloadPlacement_LongGapStillGrantsFullWindow(t *testing.T) {
 	if delay <= 0 || delay > 300*time.Second {
 		t.Fatalf("expected a full fresh window after the gap, got %v", delay)
 	}
-	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 	if got := labelSnapshot(ctx, t, c, key); !got["gpu-a"] {
 		t.Fatalf("label must survive the interrupted-controller gap, got %v", got)
 	}
@@ -218,9 +218,9 @@ func TestWorkloadPlacement_LongGapStillGrantsFullWindow(t *testing.T) {
 func TestWorkloadPlacement_UntrackedLabelGetsFullWindow(t *testing.T) {
 	ctx := context.Background()
 	e := newWlasEngine("engine", 300)
-	key, value := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 	preLabeled := nodeNamed("gpu-a")
-	preLabeled.Labels[key] = value
+	preLabeled.Labels[key] = resources.WorkloadLabelValueBase
 	c := wlasClient(t, e, preLabeled) // no workload pods at all
 
 	t0 := time.Now()
@@ -251,7 +251,7 @@ func TestWorkloadPlacement_ZeroDelayRemovesImmediately(t *testing.T) {
 	}
 	mustPlacementReconcile(ctx, t, c, e, t0.Add(time.Second))
 
-	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 	if got := labelSnapshot(ctx, t, c, key); got["gpu-a"] {
 		t.Fatalf("expected label removed with zero delay, got %v", got)
 	}
@@ -262,7 +262,7 @@ func TestWorkloadPlacement_DisabledStripsResidue(t *testing.T) {
 	e := newWlasEngine("engine", 300)
 	c := wlasClient(t, e, nodeNamed("gpu-a"),
 		boundPod("mlservices", "p1", "gpu-a", map[string]string{"app": "predictor"}))
-	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 
 	mustPlacementReconcile(ctx, t, c, e, time.Now())
 	if got := labelSnapshot(ctx, t, c, key); !got["gpu-a"] {
@@ -298,7 +298,7 @@ func TestWorkloadPlacement_IgnoresTerminatingAndTerminalPods(t *testing.T) {
 	}
 	mustPlacementReconcile(ctx, t, c, e, time.Now())
 
-	key, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key := resources.WorkloadPlacementLabel("mlservices", "engine")
 	if got := labelSnapshot(ctx, t, c, key); len(got) != 0 {
 		t.Fatalf("terminating/terminal pods must not earn labels, got %v", got)
 	}
@@ -315,8 +315,8 @@ func TestStripWorkloadPlacementLabels_PerEngineIsolation(t *testing.T) {
 	mustPlacementReconcile(ctx, t, c, e1, now)
 	mustPlacementReconcile(ctx, t, c, e2, now)
 
-	key1, _ := resources.WorkloadPlacementLabel("mlservices", "engine")
-	key2, _ := resources.WorkloadPlacementLabel("mlservices", "engine-2")
+	key1 := resources.WorkloadPlacementLabel("mlservices", "engine")
+	key2 := resources.WorkloadPlacementLabel("mlservices", "engine-2")
 	if !labelSnapshot(ctx, t, c, key1)["gpu-a"] || !labelSnapshot(ctx, t, c, key2)["gpu-b"] {
 		t.Fatal("precondition: both engines labeled their nodes")
 	}
@@ -360,9 +360,9 @@ func TestWorkloadPlacement_PreGapAbsenceEntryHonoredAcrossGap(t *testing.T) {
 	// removed. First-observed-absence never re-grants once entries exist.
 	t.Run("expired pre-gap entry is removed on resume", func(t *testing.T) {
 		e := newWlasEngine("engine", 300)
-		key, value := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+		key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 		pre := nodeNamed("gpu-a")
-		pre.Labels[key] = value
+		pre.Labels[key] = resources.WorkloadLabelValueBase
 		c := wlasClient(t, e, pre) // no matching pods; label pre-seeded
 
 		gapStart := time.Now().Add(-400 * time.Second)
@@ -381,9 +381,9 @@ func TestWorkloadPlacement_PreGapAbsenceEntryHonoredAcrossGap(t *testing.T) {
 	// honoring the pre-gap observation, full window never restarted.
 	t.Run("in-window pre-gap entry survives and keeps its window", func(t *testing.T) {
 		e := newWlasEngine("engine", 300)
-		key, value := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+		key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 		pre := nodeNamed("gpu-a")
-		pre.Labels[key] = value
+		pre.Labels[key] = resources.WorkloadLabelValueBase
 		c := wlasClient(t, e, pre)
 
 		gapStart := time.Now().Add(-60 * time.Second)
@@ -414,7 +414,7 @@ func TestWorkloadPlacement_DesiredNodeNotFoundIsSkipped(t *testing.T) {
 	c := wlasClient(t, e, nodeNamed("gpu-a"),
 		boundPod(wlasTestNamespace, "p1", "gpu-a", map[string]string{"app": "predictor"}),
 		boundPod(wlasTestNamespace, "p2", "gpu-ghost", map[string]string{"app": "predictor"}))
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 
 	if _, err := reconcileWorkloadPlacement(ctx, c, e, time.Now()); err != nil {
 		t.Fatalf("missing node object must be skipped, not fail the reconcile: %v", err)

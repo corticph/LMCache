@@ -112,7 +112,7 @@ func TestDRA_TierDaemonSetsPerNodeGPUCount(t *testing.T) {
 	podB := gpuPod("pb", "gpu-b", 2)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podA, podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
 	reconcileOnce(ctx, t, c, r, "s1")
 
@@ -189,7 +189,7 @@ func TestDRA_HysteresisDelaysTierRelabel(t *testing.T) {
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
 	reconcileOnce(ctx, t, c, r, "s1")
 
@@ -218,8 +218,8 @@ func TestDRA_HysteresisDelaysTierRelabel(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
 		t.Fatal(err)
 	}
-	if ts, ok := e.Status.NodeTierChangeSince["gpu-b"]; !ok || ts.IsZero() {
-		t.Fatalf("tier-change bookkeeping missing: %+v", e.Status.NodeTierChangeSince)
+	if ts, ok := e.Status.NodeTierChanges["gpu-b"]; !ok || ts.Since.IsZero() {
+		t.Fatalf("tier-change bookkeeping missing: %+v", e.Status.NodeTierChanges)
 	}
 
 	// Expiry cannot be simulated with wall time here; assert the window
@@ -236,7 +236,7 @@ func TestDRA_TierChangeDelayZeroAppliesImmediately(t *testing.T) {
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-b"), podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
 	reconcileOnce(ctx, t, c, r, "s1")
 	if err := c.Update(ctx, gpuPod("pb", "gpu-b", 2)); err != nil {
@@ -457,7 +457,7 @@ func TestDRA_GPUFilterMatchesPlacement(t *testing.T) {
 	}}
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), active, unbound, terminating, failed, succeeded)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
 	reconcileOnce(ctx, t, c, r, "s1")
 
@@ -479,7 +479,7 @@ func TestDRA_HysteresisAppliesAfterWindow(t *testing.T) {
 	engine := newDraEngine("s1", 300)
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasClient(t, engine, nodeNamed("gpu-b"), podB)
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
 	t0 := time.Now()
 	mustPlacementReconcile(ctx, t, c, engine, t0)
@@ -507,9 +507,9 @@ func TestDRA_HysteresisAppliesAfterWindow(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
 		t.Fatal(err)
 	}
-	since, ok := e.Status.NodeTierChangeSince["gpu-b"]
-	if !ok || since.IsZero() {
-		t.Fatalf("tier-change bookkeeping missing: %+v", e.Status.NodeTierChangeSince)
+	pending, ok := e.Status.NodeTierChanges["gpu-b"]
+	if !ok || pending.Since.IsZero() || pending.Tier != 2 {
+		t.Fatalf("tier-change bookkeeping missing or wrong target: %+v", e.Status.NodeTierChanges)
 	}
 
 	// Past the window (300s default, observed from t1): the relabel fires
@@ -525,8 +525,8 @@ func TestDRA_HysteresisAppliesAfterWindow(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
 		t.Fatal(err)
 	}
-	if len(e.Status.NodeTierChangeSince) != 0 {
-		t.Fatalf("tier-change bookkeeping must clear after applying: %+v", e.Status.NodeTierChangeSince)
+	if len(e.Status.NodeTierChanges) != 0 {
+		t.Fatalf("tier-change bookkeeping must clear after applying: %+v", e.Status.NodeTierChanges)
 	}
 }
 
@@ -538,7 +538,7 @@ func TestDRA_NonNumericResidueRelabeledImmediately(t *testing.T) {
 	engine := newDraEngine("s1", 300)
 	podB := gpuPod("pb", "gpu-b", 1)
 	node := nodeNamed("gpu-b")
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 	node.Labels[key] = "true"
 	c := wlasClient(t, engine, node, podB)
 
@@ -550,5 +550,64 @@ func TestDRA_NonNumericResidueRelabeledImmediately(t *testing.T) {
 	}
 	if fresh.Labels[key] != "1" {
 		t.Fatalf("non-numeric residue must relabel immediately, got %q", fresh.Labels[key])
+	}
+}
+
+// TestDRA_HysteresisRestartsOnNewTarget pins the window-anchor contract:
+// the hysteresis is anchored on the TARGET tier, so 1->2 aging out and
+// then the sum moving to 3 never applies 3 on 2's stale timestamp — the
+// window restarts for the new target.
+func TestDRA_HysteresisRestartsOnNewTarget(t *testing.T) {
+	ctx := context.Background()
+	engine := newDraEngine("s1", 300)
+	podB := gpuPod("pb", "gpu-b", 1)
+	c := wlasClient(t, engine, nodeNamed("gpu-b"), podB)
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+
+	t0 := time.Now()
+	mustPlacementReconcile(ctx, t, c, engine, t0)
+
+	// Observe tier 2; then, before its window expires, the target
+	// becomes 3.
+	if err := c.Update(ctx, gpuPod("pb", "gpu-b", 2)); err != nil {
+		t.Fatal(err)
+	}
+	t1 := t0.Add(60 * time.Second)
+	mustPlacementReconcile(ctx, t, c, engine, t1)
+	if err := c.Update(ctx, gpuPod("pb", "gpu-b", 3)); err != nil {
+		t.Fatal(err)
+	}
+	t2 := t1.Add(60 * time.Second)
+	mustPlacementReconcile(ctx, t, c, engine, t2)
+
+	e := &lmcachev1alpha1.LMCacheEngine{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	pending, ok := e.Status.NodeTierChanges["gpu-b"]
+	if !ok || pending.Tier != 3 {
+		t.Fatalf("pending target must be tier 3 with a restarted window, got %+v", e.Status.NodeTierChanges)
+	}
+	// The restarted window for 3 (observed at t2) must not have expired
+	// by t2+240s — 2's original window (from t1) WOULD have expired by
+	// then. This is the distinction the test exists for.
+	t3 := t2.Add(240 * time.Second)
+	mustPlacementReconcile(ctx, t, c, engine, t3)
+	node := &corev1.Node{}
+	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
+		t.Fatal(err)
+	}
+	if node.Labels[key] != "1" {
+		t.Fatalf("tier applied on the OLD target's stale timestamp: label = %q, want \"1\" until 3's own window expires", node.Labels[key])
+	}
+
+	// 3's window (from t2, 300s) expires by t4.
+	t4 := t2.Add(301 * time.Second)
+	mustPlacementReconcile(ctx, t, c, engine, t4)
+	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
+		t.Fatal(err)
+	}
+	if node.Labels[key] != "3" {
+		t.Fatalf("tier 3 not applied after its own full window: label = %q", node.Labels[key])
 	}
 }
