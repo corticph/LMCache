@@ -423,6 +423,7 @@ func buildDaemonSetCore(
 					ServiceAccountName: spec.ServiceAccountName,
 					PriorityClassName:  spec.PriorityClassName,
 					NodeSelector:       tierNodeSelector(namespace, engineName, spec, multiplier),
+					Affinity:           spec.Affinity,
 					Tolerations:        spec.Tolerations,
 					ImagePullSecrets:   spec.ImagePullSecrets,
 					InitContainers:     spec.InitContainers,

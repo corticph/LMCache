@@ -363,7 +363,7 @@ func workloadPlacementNodePredicate() predicate.Predicate {
 			if hadKey(old.Labels) || hadKey(new.Labels) {
 				return true
 			}
-			return !maps.Equal(old.Labels, new.Labels) && (hadKey(old.Labels) || hadKey(new.Labels))
+			return false
 		},
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}

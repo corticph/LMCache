@@ -427,6 +427,15 @@ func ensureDesiredWorkloadLabels(
 			continue
 		}
 		// Labeled at a different tier: apply after the hysteresis window.
+		// Non-numeric residue (e.g. the "true" value of pre-DRA
+		// intermediate builds) is not a tier change: relabel immediately,
+		// or the base DS ("1") would not match the node during the wait.
+		if current, ok := target.Labels[key]; ok && current != "" && !isNumericLabel(current) {
+			errs = append(errs, addWorkloadLabel(ctx, c, target, key, value))
+			delete(tierChangeSince, node)
+			delete(absentSince, node)
+			continue
+		}
 		since, tracked := tierChangeSince[node]
 		if !tracked {
 			since = metav1.Time{Time: now}
@@ -634,6 +643,22 @@ func timesEqual(a, b map[string]metav1.Time) bool {
 	for k, v := range a {
 		ob, ok := b[k]
 		if !ok || !v.Equal(&ob) {
+			return false
+		}
+	}
+	return true
+}
+
+// isNumericLabel reports whether a label value is a decimal number —
+// i.e. a tier value this operator wrote. Anything else (notably the
+// "true" of pre-DRA intermediate builds) is residue to relabel
+// immediately rather than gate behind the tier-change hysteresis.
+func isNumericLabel(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
 			return false
 		}
 	}

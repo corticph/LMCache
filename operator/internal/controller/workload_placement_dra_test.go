@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -466,5 +467,88 @@ func TestDRA_GPUFilterMatchesPlacement(t *testing.T) {
 	}
 	if node.Labels[key] != "1" {
 		t.Fatalf("tier = %q, want \"1\" (terminal pods must not inflate the GPU sum)", node.Labels[key])
+	}
+}
+
+// TestDRA_HysteresisAppliesAfterWindow pins the other half of the damping
+// contract: once the changed tier has been continuously observed past
+// tierChangeDelaySeconds, the relabel fires. Uses reconcileWorkloadPlacement
+// directly so `now` can be injected (mirrors the WLA release-window tests).
+func TestDRA_HysteresisAppliesAfterWindow(t *testing.T) {
+	ctx := context.Background()
+	engine := newDraEngine("s1", 300)
+	podB := gpuPod("pb", "gpu-b", 1)
+	c := wlasClient(t, engine, nodeNamed("gpu-b"), podB)
+	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+
+	t0 := time.Now()
+	mustPlacementReconcile(ctx, t, c, engine, t0)
+	node := &corev1.Node{}
+	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
+		t.Fatal(err)
+	}
+	if node.Labels[key] != "1" {
+		t.Fatalf("initial tier = %q, want \"1\"", node.Labels[key])
+	}
+
+	// The workload doubles its GPUs; inside the window nothing changes.
+	if err := c.Update(ctx, gpuPod("pb", "gpu-b", 2)); err != nil {
+		t.Fatal(err)
+	}
+	t1 := t0.Add(60 * time.Second)
+	mustPlacementReconcile(ctx, t, c, engine, t1)
+	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
+		t.Fatal(err)
+	}
+	if node.Labels[key] != "1" {
+		t.Fatalf("tier relabeled inside the hysteresis window: %q", node.Labels[key])
+	}
+	e := &lmcachev1alpha1.LMCacheEngine{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	since, ok := e.Status.NodeTierChangeSince["gpu-b"]
+	if !ok || since.IsZero() {
+		t.Fatalf("tier-change bookkeeping missing: %+v", e.Status.NodeTierChangeSince)
+	}
+
+	// Past the window (300s default, observed from t1): the relabel fires
+	// and the bookkeeping clears.
+	t2 := t1.Add(301 * time.Second)
+	mustPlacementReconcile(ctx, t, c, engine, t2)
+	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
+		t.Fatal(err)
+	}
+	if node.Labels[key] != "2" {
+		t.Fatalf("tier not relabeled after the window: %q", node.Labels[key])
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.Status.NodeTierChangeSince) != 0 {
+		t.Fatalf("tier-change bookkeeping must clear after applying: %+v", e.Status.NodeTierChangeSince)
+	}
+}
+
+// TestDRA_NonNumericResidueRelabeledImmediately: a node carrying the
+// pre-DRA "true" value must not wait out the hysteresis window — the base
+// DS selects "1", so the residue would hide the node's engine pod.
+func TestDRA_NonNumericResidueRelabeledImmediately(t *testing.T) {
+	ctx := context.Background()
+	engine := newDraEngine("s1", 300)
+	podB := gpuPod("pb", "gpu-b", 1)
+	node := nodeNamed("gpu-b")
+	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
+	node.Labels[key] = "true"
+	c := wlasClient(t, engine, node, podB)
+
+	mustPlacementReconcile(ctx, t, c, engine, time.Now())
+
+	fresh := &corev1.Node{}
+	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Labels[key] != "1" {
+		t.Fatalf("non-numeric residue must relabel immediately, got %q", fresh.Labels[key])
 	}
 }
