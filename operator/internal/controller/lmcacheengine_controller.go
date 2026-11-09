@@ -27,6 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sptr "k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -217,7 +218,7 @@ func (r *LMCacheEngineReconciler) purgeWorkloadPlacement(ctx context.Context, en
 		// the finalizer must stay.
 		return true, nil
 	}
-	key, _ := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
+	key := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 
 	// The live DaemonSet is authoritative: if it still selects on the key,
 	// its update has not landed — do not purge. Tier DaemonSets are
@@ -318,9 +319,18 @@ func workloadPlacementPodPredicate() predicate.Predicate {
 				return false
 			case old.Spec.NodeName != new.Spec.NodeName:
 				return true
-			case old.DeletionTimestamp != new.DeletionTimestamp:
+			case !k8sptr.Equal(old.DeletionTimestamp, new.DeletionTimestamp):
 				return true
 			case !maps.Equal(old.Labels, new.Labels):
+				return true
+			case old.Status.Phase != new.Status.Phase &&
+				(new.Status.Phase == corev1.PodSucceeded || new.Status.Phase == corev1.PodFailed):
+				// A pod reaching a terminal phase no longer counts for
+				// placement or the tier multiplier, and nothing else in
+				// the pod object changes on that transition — without
+				// this case a finished Job pod (e.g. lingering on
+				// ttlSecondsAfterFinished) would strand its node's
+				// label and engine forever.
 				return true
 			default:
 				return false
@@ -338,21 +348,23 @@ func placementPod(obj client.Object) bool {
 }
 
 // workloadPlacementNodePredicate filters node events to managed-label
-// changes: if someone or something removed a `lmcache.ai/wlas-` label from a
-// node that still hosts the workload, nothing restores it until this watch
-// enqueues the owning engines — otherwise the DaemonSet pod there is
-// deleted and simply not recreated.
+// CHANGES: if someone or something removed or retiered a `lmcache.ai/wlas-`
+// label on a node that still hosts the workload, nothing repairs it until
+// this watch enqueues the owning engines. Comparing the managed-label
+// subset — not mere presence — also keeps routine kubelet status churn on
+// labeled nodes from fanning out to every engine reconcile.
 func workloadPlacementNodePredicate() predicate.Predicate {
-	hadKey := func(ls map[string]string) bool {
-		for k := range ls {
+	wlasLabels := func(ls map[string]string) map[string]string {
+		out := map[string]string{}
+		for k, v := range ls {
 			if strings.HasPrefix(k, resources.WorkloadLabelPrefix) {
-				return true
+				out[k] = v
 			}
 		}
-		return false
+		return out
 	}
 	return predicate.Funcs{
-		CreateFunc: func(ev event.CreateEvent) bool { return hadKey(ev.Object.GetLabels()) },
+		CreateFunc: func(ev event.CreateEvent) bool { return len(wlasLabels(ev.Object.GetLabels())) > 0 },
 		DeleteFunc: func(ev event.DeleteEvent) bool { return true }, // a labeled node loss re-reconciles all engines
 		UpdateFunc: func(ev event.UpdateEvent) bool {
 			old, okOld := ev.ObjectOld.(*corev1.Node)
@@ -360,10 +372,7 @@ func workloadPlacementNodePredicate() predicate.Predicate {
 			if !okOld || !okNew {
 				return false
 			}
-			if hadKey(old.Labels) || hadKey(new.Labels) {
-				return true
-			}
-			return false
+			return !maps.Equal(wlasLabels(old.Labels), wlasLabels(new.Labels))
 		},
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}

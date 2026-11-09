@@ -79,35 +79,31 @@ func TierLabelValue(multiplier int32) string {
 // node's tier multiplier; the base (1x) DaemonSet selects the base value.
 func EffectiveNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCacheEngineSpec) map[string]string {
 	if w := spec.WorkloadAwareScheduling; w != nil && w.Enabled {
-		key, _ := WorkloadPlacementLabel(namespace, name)
-		return MergeLabels(spec.NodeSelector, map[string]string{key: tierSelectorValue(w)})
+		key := WorkloadPlacementLabel(namespace, name)
+		// Tier 1 is the base label value whether or not DRA is on; a
+		// node labeled with a higher tier simply does not match the
+		// base DS.
+		return MergeLabels(spec.NodeSelector, map[string]string{key: WorkloadLabelValueBase})
 	}
 	return spec.NodeSelector
-}
-
-// tierSelectorValue is the label value the base DaemonSet's nodeSelector
-// requires: "1" whether or not DRA is on (tier 1 is the default value; a
-// node labeled with a higher tier simply does not match the base DS).
-func tierSelectorValue(w *lmcachev1alpha1.WorkloadAwareSchedulingSpec) string {
-	return WorkloadLabelValueBase
 }
 
 // TierNodeSelector returns the nodeSelector for a tier DaemonSet of the
 // given multiplier (N >= 2, DRA enabled): spec.nodeSelector plus the
 // placement label pinned to the tier value.
 func TierNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCacheEngineSpec, multiplier int32) map[string]string {
-	key, _ := WorkloadPlacementLabel(namespace, name)
+	key := WorkloadPlacementLabel(namespace, name)
 	return MergeLabels(spec.NodeSelector, map[string]string{key: TierLabelValue(multiplier)})
 }
 
-// WorkloadPlacementLabel returns the node label key/value pair an
-// LMCacheEngine manages on nodes hosting its matching workload pods. The
-// key embeds an 8-hex fnv64a hash of "namespace/name": deterministic,
-// collision-safe for practical fleet sizes, and terse. The value is the
-// node's tier multiplier ("1" unless dynamic resource allocation is
-// enabled); callers stamping the base value use WorkloadLabelValueBase.
-func WorkloadPlacementLabel(namespace, name string) (key, value string) {
+// WorkloadPlacementLabel returns the node label key an LMCacheEngine
+// manages on nodes hosting its matching workload pods. The key embeds an
+// 8-hex fnv64a hash of "namespace/name": deterministic, collision-safe
+// for practical fleet sizes, and terse. The label's value is the node's
+// tier multiplier — WorkloadLabelValueBase ("1") unless dynamic resource
+// allocation is enabled.
+func WorkloadPlacementLabel(namespace, name string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(namespace + "/" + name))
-	return fmt.Sprintf("%s%x", WorkloadLabelPrefix, h.Sum64()), WorkloadLabelValueBase
+	return fmt.Sprintf("%s%x", WorkloadLabelPrefix, h.Sum64())
 }

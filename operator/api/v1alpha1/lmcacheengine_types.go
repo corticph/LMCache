@@ -768,15 +768,17 @@ type LMCacheEngineStatus struct {
 	// +optional
 	WorkloadLabelKey string `json:"workloadLabelKey,omitempty"`
 
-	// nodeTierChangeSince records when a node's computed tier multiplier
-	// first differed from its current label value. The relabel (and the
-	// engine-pod restart it causes) is applied once the change has been
-	// stably observed for tierChangeDelaySeconds. Internal bookkeeping;
-	// entries clear when the computed tier returns to the labeled value or
-	// the node is released.
+	// nodeTierChanges records each node's PENDING tier change: the
+	// multiplier being waited out and when it was FIRST observed. The
+	// relabel (and the engine-pod restart it causes) is applied once the
+	// pending tier has been stably observed for tierChangeDelaySeconds; a
+	// NEW target tier restarts the window (1->2 then 2->3 never applies
+	// 3 on 2's aged-out timestamp). Internal bookkeeping; entries clear
+	// when the computed tier returns to the labeled value or the node is
+	// released.
 	// +optional
-	// +kubebuilder:example={"node-a":"2026-10-19T09:00:00Z"}
-	NodeTierChangeSince map[string]metav1.Time `json:"nodeTierChangeSince,omitempty"`
+	// +kubebuilder:example={"node-a":{"tier":2,"since":"2026-10-19T09:00:00Z"}}
+	NodeTierChanges map[string]NodeTierChange `json:"nodeTierChanges,omitempty"`
 
 	// nodeAbsentSince records when a node carrying the managed label was
 	// FIRST observed without matching workload pods. The release window runs
@@ -825,4 +827,14 @@ type LMCacheEngineList struct {
 
 func init() {
 	SchemeBuilder.Register(&LMCacheEngine{}, &LMCacheEngineList{})
+}
+
+// NodeTierChange is the pending tier change of one node: the target
+// multiplier and when it was first observed.
+type NodeTierChange struct {
+	// tier is the pending target multiplier.
+	Tier int32 `json:"tier"`
+
+	// since is when this target tier was first observed.
+	Since metav1.Time `json:"since"`
 }

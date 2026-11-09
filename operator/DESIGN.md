@@ -588,7 +588,8 @@ only after it has been continuously observed for
 `tierChangeDelaySeconds` (default 300, 0 = immediate): the relabel
 restarts the engine pod and drops its warm L1, and workload rolling
 updates transiently change the GPU sum (surge pods). Bookkeeping lives in
-`status.nodeTierChangeSince`, mirroring `nodeAbsentSince`; the pending
+`status.nodeTierChanges` (pending tier + first-observed timestamp, so a
+changed target restarts the window), mirroring `nodeAbsentSince`; the pending
 deadline feeds the same RequeueAfter as release windows. Changing
 `gpusPerUnit`/`maxMultiplier` while enabled is allowed and damped the
 same way.
@@ -606,7 +607,14 @@ enabled — tier DSs scale the auto-computed memory, and overrides would
 silently bypass it; scaling overrides proportionally is a possible
 follow-up. `gpuVendor` must be `nvidia` or `amd`, and the engine name must
 leave room for the `-<N>x` suffix (the `dra-tier` label value is capped at
-63 characters; validation rejects over-long names).
+63 characters; validation rejects over-long names). Only the standard
+resource names `nvidia.com/gpu` / `amd.com/gpu` count toward the tier; MIG
+and other fractional GPU resource names (or GPU-Operator time-slicing
+without per-pod claims) leave the node at tier 1 — biased small, never
+over-provisioning. With `spec.hostNetwork: true`, a tier change briefly
+contends the old pod and the new tier pod for the same host ports; the
+scheduler holds the new pod Pending until the old one exits, so expect a
+short engine gap on the node during the swap.
 
 ## Validation
 

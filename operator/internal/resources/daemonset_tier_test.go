@@ -104,7 +104,7 @@ func TestBuildTieredDaemonSet(t *testing.T) {
 	}
 
 	// nodeSelector pins the placement label at the tier value.
-	key, _ := WorkloadPlacementLabel(engine.Namespace, engine.Name)
+	key := WorkloadPlacementLabel(engine.Namespace, engine.Name)
 	if got := ds.Spec.Template.Spec.NodeSelector[key]; got != "2" {
 		t.Fatalf("tier DS nodeSelector[%s] = %q, want \"2\"", key, got)
 	}

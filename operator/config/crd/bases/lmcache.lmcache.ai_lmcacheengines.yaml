@@ -5546,19 +5546,37 @@ spec:
                 example:
                   node-a: "2026-10-19T09:00:00Z"
                 type: object
-              nodeTierChangeSince:
+              nodeTierChanges:
                 additionalProperties:
-                  format: date-time
-                  type: string
+                  description: |-
+                    NodeTierChange is the pending tier change of one node: the target
+                    multiplier and when it was first observed.
+                  properties:
+                    since:
+                      description: since is when this target tier was first observed.
+                      format: date-time
+                      type: string
+                    tier:
+                      description: tier is the pending target multiplier.
+                      format: int32
+                      type: integer
+                  required:
+                  - since
+                  - tier
+                  type: object
                 description: |-
-                  nodeTierChangeSince records when a node's computed tier multiplier
-                  first differed from its current label value. The relabel (and the
-                  engine-pod restart it causes) is applied once the change has been
-                  stably observed for tierChangeDelaySeconds. Internal bookkeeping;
-                  entries clear when the computed tier returns to the labeled value or
-                  the node is released.
+                  nodeTierChanges records each node's PENDING tier change: the
+                  multiplier being waited out and when it was FIRST observed. The
+                  relabel (and the engine-pod restart it causes) is applied once the
+                  pending tier has been stably observed for tierChangeDelaySeconds; a
+                  NEW target tier restarts the window (1->2 then 2->3 never applies
+                  3 on 2's aged-out timestamp). Internal bookkeeping; entries clear
+                  when the computed tier returns to the labeled value or the node is
+                  released.
                 example:
-                  node-a: "2026-10-19T09:00:00Z"
+                  node-a:
+                    since: "2026-10-19T09:00:00Z"
+                    tier: 2
                 type: object
               observedGeneration:
                 description: observedGeneration is the most recent generation observed.

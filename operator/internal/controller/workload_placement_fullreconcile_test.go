@@ -74,7 +74,7 @@ func TestDisableOrdering_ReconcilePurgesOnlyAfterSelectorIsClean(t *testing.T) {
 	pod := boundPod(wlasTestNamespace, "p1", "gpu-a", map[string]string{"app": "predictor"})
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), pod)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: wlasTestNamespace, Name: "engine"}}
 
 	// --- Enabled Reconcile: label applied, DS selector carries the key.
@@ -143,7 +143,7 @@ func TestDisableOrdering_GuardRefusesWhileSelectorReferencesThem(t *testing.T) {
 	pod := boundPod(wlasTestNamespace, "p1", "gpu-a", map[string]string{"app": "predictor"})
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), pod)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: wlasTestNamespace, Name: "engine"}}
 
 	if _, err := r.Reconcile(ctx, req); err != nil {
@@ -198,7 +198,7 @@ func TestFullReconcile_PlacementStatusSurvivesUpdateStatus(t *testing.T) {
 	pod := boundPod(wlasTestNamespace, "p1", "gpu-a", map[string]string{"app": "predictor"})
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), pod)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
-	key, _ := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
+	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: wlasTestNamespace, Name: "engine"}}
 
 	// Pass 1: workload leaves gpu-b after having been there (injected as a
