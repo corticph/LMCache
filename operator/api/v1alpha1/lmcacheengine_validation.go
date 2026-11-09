@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"fmt"
+
 	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -44,6 +46,7 @@ func (e *LMCacheEngine) ValidateSpec() field.ErrorList {
 	errs = append(errs, validateL2BackendSpec(spec.L2Backend)...)
 	errs = append(errs, validateCoordinatorConnectionSpec(spec.Coordinator)...)
 	errs = append(errs, validateWorkloadAwareSchedulingSpec(spec.WorkloadAwareScheduling)...)
+	errs = append(errs, validateDynamicResourceAllocationSpec(e, spec.WorkloadAwareScheduling)...)
 
 	return errs
 }
@@ -72,6 +75,56 @@ func validateWorkloadAwareSchedulingSpec(w *WorkloadAwareSchedulingSpec) field.E
 	}
 	errs = append(errs, metav1validation.ValidateLabelSelector(
 		w.WorkloadSelector, metav1validation.LabelSelectorValidationOptions{}, path)...)
+	return errs
+}
+
+// validateDynamicResourceAllocationSpec enforces the DRA contracts:
+//   - DRA implies WLA (tier derivation reads the pods the placement
+//     selector follows; without it there is no node set to tier).
+//   - resourceOverrides is rejected: ComputeResources returns overrides
+//     verbatim, so a tier DaemonSet would silently NOT get scaled memory.
+//     Scaling overrides proportionally is a possible follow-up.
+//   - gpuVendor must be nvidia or amd: the multiplier reads the vendor's
+//     extended resource name from the workload pods.
+//   - The engine name must leave room for the tier suffix: the
+//     lmcache.ai/dra-tier label value is the tier DaemonSet's name,
+//     <engine>-<N>x, capped at 63 characters.
+func validateDynamicResourceAllocationSpec(e *LMCacheEngine, w *WorkloadAwareSchedulingSpec) field.ErrorList {
+	var errs field.ErrorList
+	if w == nil || w.DynamicResourceAllocation == nil || !w.DynamicResourceAllocation.Enabled {
+		return errs
+	}
+	if !w.Enabled {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "workloadAwareScheduling", "dynamicResourceAllocation", "enabled"), true,
+			"requires workloadAwareScheduling.enabled: tier derivation follows the same workload pods as placement"))
+	}
+	dra := w.DynamicResourceAllocation
+	if e.Spec.ResourceOverrides != nil {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "resourceOverrides"), e.Spec.ResourceOverrides,
+			"cannot be combined with workloadAwareScheduling.dynamicResourceAllocation: "+
+				"tier DaemonSets scale the auto-computed memory request and would ignore overrides"))
+	}
+	vendor := GPUVendorNvidia
+	if e.Spec.GPUVendor != nil {
+		vendor = *e.Spec.GPUVendor
+	}
+	if vendor != GPUVendorNvidia && vendor != GPUVendorAMD {
+		errs = append(errs, field.Invalid(
+			field.NewPath("spec", "gpuVendor"), vendor,
+			"must be nvidia or amd when dynamicResourceAllocation is enabled: "+
+				"the tier multiplier reads that vendor's GPU resource name from workload pods"))
+	}
+	// dra-tier label value = tier DS name "<engine>-<N>x"; worst suffix is
+	// "-<maxMultiplier>x".
+	suffixLen := 1 + len(fmt.Sprintf("%d", dra.EffectiveDRAMaxMultiplier())) + 1
+	if len(e.Name)+suffixLen > 63 {
+		errs = append(errs, field.Invalid(
+			field.NewPath("metadata", "name"), e.Name,
+			fmt.Sprintf("too long for dynamicResourceAllocation: the tier DaemonSet label value "+
+				"\"<name>-<N>x\" is capped at 63 characters (max %d)", 63-suffixLen)))
+	}
 	return errs
 }
 

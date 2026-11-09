@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
+	"strconv"
 
 	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
 )
@@ -57,28 +58,56 @@ func MergeLabels(labelMaps ...map[string]string) map[string]string {
 // watch predicate, which acts on any label carrying this prefix.
 const WorkloadLabelPrefix = "lmcache.ai/wlas-"
 
-// WorkloadLabelValue is the (constant) value of the managed node label.
-const WorkloadLabelValue = "true"
+// WorkloadLabelValueBase is the label value stamped on every node when
+// dynamic resource allocation is off: the tier multiplier "1". Keeping it
+// numeric (rather than "true") means enabling DRA later only changes the
+// value, never the semantics, of the existing placement label.
+const WorkloadLabelValueBase = "1"
+
+// TierLabelValue returns the managed node-label value for a tier
+// multiplier: its decimal string ("1", "2", ...).
+func TierLabelValue(multiplier int32) string {
+	return strconv.Itoa(int(multiplier))
+}
 
 // EffectiveNodeSelector returns the DaemonSet nodeSelector for an engine:
 // spec.nodeSelector alone, or — when workload-aware scheduling is enabled —
 // merged with the managed placement label the operator maintains on nodes
 // hosting matching workload pods. The extra key is what stops the DS
 // controller from creating engine pods on nodes without the workload.
+// With dynamic resource allocation the label value on a node is that
+// node's tier multiplier; the base (1x) DaemonSet selects the base value.
 func EffectiveNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCacheEngineSpec) map[string]string {
 	if w := spec.WorkloadAwareScheduling; w != nil && w.Enabled {
-		key, value := WorkloadPlacementLabel(namespace, name)
-		return MergeLabels(spec.NodeSelector, map[string]string{key: value})
+		key, _ := WorkloadPlacementLabel(namespace, name)
+		return MergeLabels(spec.NodeSelector, map[string]string{key: tierSelectorValue(w)})
 	}
 	return spec.NodeSelector
+}
+
+// tierSelectorValue is the label value the base DaemonSet's nodeSelector
+// requires: "1" whether or not DRA is on (tier 1 is the default value; a
+// node labeled with a higher tier simply does not match the base DS).
+func tierSelectorValue(w *lmcachev1alpha1.WorkloadAwareSchedulingSpec) string {
+	return WorkloadLabelValueBase
+}
+
+// TierNodeSelector returns the nodeSelector for a tier DaemonSet of the
+// given multiplier (N >= 2, DRA enabled): spec.nodeSelector plus the
+// placement label pinned to the tier value.
+func TierNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCacheEngineSpec, multiplier int32) map[string]string {
+	key, _ := WorkloadPlacementLabel(namespace, name)
+	return MergeLabels(spec.NodeSelector, map[string]string{key: TierLabelValue(multiplier)})
 }
 
 // WorkloadPlacementLabel returns the node label key/value pair an
 // LMCacheEngine manages on nodes hosting its matching workload pods. The
 // key embeds an 8-hex fnv64a hash of "namespace/name": deterministic,
-// collision-safe for practical fleet sizes, and terse.
+// collision-safe for practical fleet sizes, and terse. The value is the
+// node's tier multiplier ("1" unless dynamic resource allocation is
+// enabled); callers stamping the base value use WorkloadLabelValueBase.
 func WorkloadPlacementLabel(namespace, name string) (key, value string) {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(namespace + "/" + name))
-	return fmt.Sprintf("%s%x", WorkloadLabelPrefix, h.Sum64()), WorkloadLabelValue
+	return fmt.Sprintf("%s%x", WorkloadLabelPrefix, h.Sum64()), WorkloadLabelValueBase
 }

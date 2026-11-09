@@ -142,6 +142,16 @@ func (r *LMCacheEngineReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 7.2 Reconcile tier DaemonSets (dynamic resource allocation): create
+	//     or patch one DS per active tier N>=2, delete owned tier DSs
+	//     whose tier is no longer active. Runs after the base DS step so
+	//     nodes are labeled before the DS nodeSelectors ask for the tier
+	//     values (the placement step 6 above owns the labeling order).
+	if err := r.reconcileTierDaemonSets(ctx, engine); err != nil {
+		log.Error(err, "Failed to reconcile tier DaemonSets")
+		return ctrl.Result{}, err
+	}
+
 	// 7.5 Disabled-after-enabled cleanup: run only AFTER the DaemonSet step
 	// above has accepted the label-free selector. purgeWorkloadPlacement
 	// then re-reads the live DaemonSet and refuses to purge while its
@@ -210,7 +220,10 @@ func (r *LMCacheEngineReconciler) purgeWorkloadPlacement(ctx context.Context, en
 	key, _ := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 
 	// The live DaemonSet is authoritative: if it still selects on the key,
-	// its update has not landed — do not purge.
+	// its update has not landed — do not purge. Tier DaemonSets are
+	// deleted beforehand by reconcileTierDaemonSets and are deliberately
+	// NOT read here: a tier DS still terminating cannot block the purge,
+	// because the guard only inspects the base DS's nodeSelector.
 	ds := &appsv1.DaemonSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: engine.Name, Namespace: engine.Namespace}, ds)
 	switch {
