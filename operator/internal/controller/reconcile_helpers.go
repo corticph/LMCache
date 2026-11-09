@@ -283,8 +283,8 @@ func (r *LMCacheEngineReconciler) activeTiers(ctx context.Context, engine *lmcac
 	for _, node := range labeled {
 		m, err := strconv.ParseInt(node.Labels[key], 10, 32)
 		if err != nil {
-			// Unparseable residue (e.g. a pre-DRA "true" value): treat
-			// as tier 1 — the next placement pass relabels it.
+			// A non-numeric residue (e.g. a pre-DRA "true" value):
+			// treat as tier 1 — the next placement pass relabels it.
 			m = 1
 		}
 		tiers[int32(m)] = struct{}{}
