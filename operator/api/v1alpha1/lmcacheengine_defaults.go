@@ -78,6 +78,49 @@ func (e *LMCacheEngine) WorkloadReleaseDelay() time.Duration {
 	return 0
 }
 
+// DRA defaults mirror the kubebuilder markers (1 / 8 / 300) for in-memory
+// objects that skipped SetDefaults or CRD-defaulting.
+const (
+	defaultDRAGPUsPerUnit         = 1
+	defaultDRAMaxMultiplier       = 8
+	defaultDRATierChangeDelaySecs = 300
+)
+
+// DynamicResourceAllocationEnabled reports whether dynamic resource
+// allocation (per-node tiered DaemonSets) is on. Implies
+// WorkloadSchedulingEnabled: validation rejects the other combination.
+func (e *LMCacheEngine) DynamicResourceAllocationEnabled() bool {
+	if w := e.Spec.WorkloadAwareScheduling; w != nil && w.Enabled {
+		return w.DynamicResourceAllocation != nil && w.DynamicResourceAllocation.Enabled
+	}
+	return false
+}
+
+// EffectiveDRAGPUsPerUnit returns gpusPerUnit with its default applied.
+func (s *DynamicResourceAllocationSpec) EffectiveDRAGPUsPerUnit() int32 {
+	if s.GPUsPerUnit == nil {
+		return defaultDRAGPUsPerUnit
+	}
+	return *s.GPUsPerUnit
+}
+
+// EffectiveDRAMaxMultiplier returns maxMultiplier with its default applied.
+func (s *DynamicResourceAllocationSpec) EffectiveDRAMaxMultiplier() int32 {
+	if s.MaxMultiplier == nil {
+		return defaultDRAMaxMultiplier
+	}
+	return *s.MaxMultiplier
+}
+
+// EffectiveDRATierChangeDelay returns tierChangeDelaySeconds as a duration,
+// with its default applied.
+func (s *DynamicResourceAllocationSpec) EffectiveDRATierChangeDelay() time.Duration {
+	if s.TierChangeDelaySeconds == nil {
+		return time.Duration(defaultDRATierChangeDelaySecs) * time.Second
+	}
+	return time.Duration(*s.TierChangeDelaySeconds) * time.Second
+}
+
 // WorkloadSchedulingEnabled reports whether workload-aware scheduling is on.
 func (e *LMCacheEngine) WorkloadSchedulingEnabled() bool {
 	w := e.Spec.WorkloadAwareScheduling

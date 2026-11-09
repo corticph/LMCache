@@ -527,6 +527,87 @@ prevent creation — only park it Pending, which is the original problem.
 Mirroring the workload's presence onto the node label space is the only
 bridge available without changing the engine's object form.
 
+
+### Dynamic resource allocation (`spec.workloadAwareScheduling.dynamicResourceAllocation`)
+
+Workload-aware placement gives every node the same engine spec. On nodes
+where the co-located workload is small (or shares the node with another
+engine's workload), a larger L1 would fit and serve more cache. DRA
+derives a per-node **tier multiplier** from the GPU requests of the
+matching workload pods and runs one DaemonSet per active tier:
+
+```yaml
+spec:
+  workloadAwareScheduling:
+    enabled: true
+    workloadSelector:
+      matchLabels: {app: predictor}
+    dynamicResourceAllocation:
+      enabled: true
+      gpusPerUnit: 1        # multiplier = ceil(node GPUs / gpusPerUnit)
+      maxMultiplier: 8     # clamp; see sizing note
+      tierChangeDelaySeconds: 300
+```
+
+**Tier derivation.** For every node hosting ≥1 matching pod:
+`multiplier = min(maxMultiplier, max(1, ceil(totalGPUs / gpusPerUnit)))`,
+where `totalGPUs` sums the regular containers' `Requests["nvidia.com/gpu"`
+(or `amd.com/gpu`, per `gpuVendor`) over the same filtered pod list that
+placement uses (bound, non-terminating, not Failed/Succeeded — one shared
+filter function, so node selection and GPU summation cannot drift). Init
+containers do not count: they release their GPUs before app containers
+run. Fractional requests are summed, then rounded up once.
+
+**One node label, tier in the value.** The existing `lmcache.ai/wlas-<hash>`
+label's value becomes the tier: `"1"` with DRA off (identical semantics to
+the previous `"true"`), `"1".."N"` with it. Presence and tier are stamped
+atomically in one label write, so a DS can never reference a tier value
+before the node carries it.
+
+**DaemonSet fleet.** The base DS keeps its name and its selector
+(`instance=<engine>`) unchanged — `spec.selector` is immutable, so enabling
+DRA on an existing engine only patches mutable template fields (the base
+nodeSelector pins the label at `"1"`). Each active tier N ≥ 2 gets a
+`<engine>-<N>x` DS: L1 size (`--l1-size-gb`), memory request
+(`ceil(N * l1.sizeGB + 5) Gi`, limit 1.5×) and startup-probe window all
+scale by N; its selector adds `lmcache.ai/dra-tier: <dsName>`; its
+nodeSelector pins the placement label at `"<N>"`. All tier templates keep
+the shared `instance=<engine>` label, so the node-local lookup Service and
+metrics Service match every tier's pods unchanged. The base selector
+therefore *overlaps* tier pods — safe, because the DS controller adopts
+only orphaned pods and tier pods carry a controller ownerRef to their tier
+DS. Tier DSs are matched for cleanup and status by ownerRef plus the
+`dra-tier` template label, never by name pattern (a CR named `s1-2x` must
+not collide with `s1`'s tier DS). Heterogeneous L1 sizes across pods of
+one engine are safe: cache sharing is pull-based P2P with no capacity
+negotiation.
+
+**Tier-change hysteresis.** A node's FIRST label lands immediately
+(placement — the workload needs its engine). A CHANGED tier is applied
+only after it has been continuously observed for
+`tierChangeDelaySeconds` (default 300, 0 = immediate): the relabel
+restarts the engine pod and drops its warm L1, and workload rolling
+updates transiently change the GPU sum (surge pods). Bookkeeping lives in
+`status.nodeTierChangeSince`, mirroring `nodeAbsentSince`; the pending
+deadline feeds the same RequeueAfter as release windows. Changing
+`gpusPerUnit`/`maxMultiplier` while enabled is allowed and damped the
+same way.
+
+**Status.** `desiredInstances` sums `DesiredNumberScheduled` over all
+owned DSs; `readyInstances` counts ready pods from the pod list (per-DS
+`NumberReady` is ambiguous under the overlapping base selector). Both
+fields mean "across the whole fleet" now, not "the one DS".
+
+**Limitations / sizing.** `maxMultiplier` must be sized so
+`ceil(maxMultiplier * l1.sizeGB + 5) Gi` fits a node's allocatable
+memory: an oversized tier pod stays Pending with no operator feedback (no
+event is emitted in v1). `spec.resourceOverrides` is rejected with DRA
+enabled — tier DSs scale the auto-computed memory, and overrides would
+silently bypass it; scaling overrides proportionally is a possible
+follow-up. `gpuVendor` must be `nvidia` or `amd`, and the engine name must
+leave room for the `-<N>x` suffix (the `dra-tier` label value is capped at
+63 characters; validation rejects over-long names).
+
 ## Validation
 
 `workloadSelector` is required when enabled, and must be non-empty and

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"sort"
 	"time"
 
@@ -73,12 +74,14 @@ func workloadMatches(engine *lmcachev1alpha1.LMCacheEngine, podLabels map[string
 	return sel.Matches(labels.Set(podLabels))
 }
 
-// desiredWorkloadNodes returns the sorted, deduplicated nodes hosting bound,
-// non-terminating workload pods in the engine's namespace. "Bound"
-// (spec.nodeName set) rather than "Ready" deliberately: the engine must be
-// booting while the workload still loads weights, and both finish long
-// before the KV connector's server handshake timeout.
-func desiredWorkloadNodes(ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine) ([]string, error) {
+// matchingWorkloadPods returns the workload pods that count for placement
+// AND for the dynamic-resource-allocation tier multiplier: matching
+// spec.workloadAwareScheduling.workloadSelector, bound (spec.nodeName
+// set — the engine must be booting while the workload still loads
+// weights), not terminating, not Failed/Succeeded. Node selection and
+// GPU summation must consume this ONE filtered list so the two can never
+// drift (e.g. finished Job pods would otherwise inflate the tier).
+func matchingWorkloadPods(ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine) ([]*corev1.Pod, error) {
 	sel, err := workloadSelectorFor(engine)
 	if err != nil {
 		return nil, err
@@ -90,8 +93,7 @@ func desiredWorkloadNodes(ctx context.Context, c client.Client, engine *lmcachev
 	); err != nil {
 		return nil, err
 	}
-	seen := map[string]struct{}{}
-	nodes := make([]string, 0, len(pods.Items))
+	out := make([]*corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Spec.NodeName == "" || pod.DeletionTimestamp != nil {
@@ -100,19 +102,24 @@ func desiredWorkloadNodes(ctx context.Context, c client.Client, engine *lmcachev
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			continue
 		}
-		if _, dup := seen[pod.Spec.NodeName]; dup {
-			continue
-		}
-		seen[pod.Spec.NodeName] = struct{}{}
-		nodes = append(nodes, pod.Spec.NodeName)
+		out = append(out, pod)
 	}
-	sort.Strings(nodes)
-	return nodes, nil
+	return out, nil
 }
 
-// reconcileWorkloadPlacement syncs the managed node labels for one engine and
-// returns the wait until the next node exits its release window (zero when
-// nothing is pending), which the caller turns into a RequeueAfter.
+// reconcileWorkloadPlacement syncs the managed node labels for one engine
+// and returns the wait until the next timed transition — a node exiting
+// its release window or a tier change leaving its hysteresis window
+// (zero when nothing is pending), which the caller turns into a
+// RequeueAfter.
+//
+// The label value is the node's tier multiplier: the base "1" unless
+// dynamic resource allocation is enabled, in which case it is derived
+// from the workload pods' GPU requests. A FIRST label (placement) is
+// applied immediately; a CHANGED tier is applied only once it has been
+// continuously observed for tierChangeDelaySeconds — the relabel
+// restarts the engine pod and drops its warm L1, so transient GPU-sum
+// changes (workload rolling updates, surge pods) must not flap it.
 //
 // Failure direction: an error adding a needed label fails loudly (the
 // workload would lack an engine); a node that must lose its label but cannot
@@ -121,49 +128,173 @@ func desiredWorkloadNodes(ctx context.Context, c client.Client, engine *lmcachev
 func reconcileWorkloadPlacement(
 	ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine, now time.Time,
 ) (time.Duration, error) {
-	key, value := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
+	key, _ := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 
 	if !engine.WorkloadSchedulingEnabled() {
 		return 0, reconcileWorkloadPlacementOff(ctx, c, engine, key)
 	}
 
-	desired, err := desiredWorkloadNodes(ctx, c, engine)
+	pods, err := matchingWorkloadPods(ctx, c, engine)
 	if err != nil {
 		return 0, fmt.Errorf("listing workload pods: %w", err)
 	}
+	desired := sortedNodeNames(pods)
 	desiredSet := make(map[string]struct{}, len(desired))
 	for _, n := range desired {
 		desiredSet[n] = struct{}{}
 	}
+
+	// Per-node tier multipliers from the same filtered pod list that
+	// drove node selection — the filter cannot drift between the two.
+	tiers := computeNodeTiers(engine, pods)
 
 	labeled, err := listLabeledNodes(ctx, c, key)
 	if err != nil {
 		return 0, err
 	}
 
-	// Copy-on-write bookkeeping: absence entries are only persisted when a
-	// pass actually changed them, guarding against chronic status churn.
+	// Copy-on-write bookkeeping: entries are only persisted when a pass
+	// actually changed them, guarding against chronic status churn.
 	absentSince := maps.Clone(engine.Status.NodeAbsentSince)
 	if absentSince == nil {
 		absentSince = map[string]metav1.Time{}
 	}
+	tierChangeSince := maps.Clone(engine.Status.NodeTierChangeSince)
+	if tierChangeSince == nil {
+		tierChangeSince = map[string]metav1.Time{}
+	}
 
-	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, desiredSet, key, value, absentSince); err != nil {
+	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, desiredSet, key, tiers, absentSince, tierChangeSince, now, engine); err != nil {
 		return 0, err
 	}
 
 	nextExpiry := releaseExpiredWorkloadNodes(ctx, c, labeled, desiredSet, absentSince, engine.WorkloadReleaseDelay(), now, key)
+	// Tier-change bookkeeping dies with the release.
+	for nodeName := range labeled {
+		if _, ok := desiredSet[nodeName]; !ok {
+			delete(tierChangeSince, nodeName)
+		}
+	}
 
 	pruneStaleWorkloadAbsence(absentSince, labeled, desiredSet)
+	pruneStaleTierChanges(tierChangeSince, labeled, desiredSet)
 
-	if err := updateWorkloadPlacementStatus(ctx, c, engine, key, desiredSet, absentSince); err != nil {
+	nextTierApply := nextTierChange(tierChangeSince, engine, now)
+
+	if err := updateWorkloadPlacementStatus(ctx, c, engine, key, desiredSet, absentSince, tierChangeSince); err != nil {
 		return 0, err
 	}
 
-	if nextExpiry.IsZero() {
+	next := earliest(nextExpiry, nextTierApply)
+	if next.IsZero() {
 		return 0, nil
 	}
-	return nextExpiry.Sub(now), nil
+	return next.Sub(now), nil
+}
+
+// sortedNodeNames deduplicates and sorts the nodes of the given pods.
+func sortedNodeNames(pods []*corev1.Pod) []string {
+	seen := map[string]struct{}{}
+	nodes := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		if _, dup := seen[pod.Spec.NodeName]; dup {
+			continue
+		}
+		seen[pod.Spec.NodeName] = struct{}{}
+		nodes = append(nodes, pod.Spec.NodeName)
+	}
+	sort.Strings(nodes)
+	return nodes
+}
+
+// computeNodeTiers derives each node's tier multiplier from the GPU
+// requests of its workload pods: multiplier = min(maxMultiplier,
+// max(1, ceil(totalGPUs / gpusPerUnit))). Only meaningful when DRA is
+// enabled; without it every node is tier 1. Init containers and ephemeral
+// containers do not count: init containers release their GPUs before app
+// containers run, so they misrepresent steady-state occupancy.
+func computeNodeTiers(engine *lmcachev1alpha1.LMCacheEngine, pods []*corev1.Pod) map[string]int32 {
+	tiers := make(map[string]int32, len(pods))
+	dra := engine.Spec.WorkloadAwareScheduling.DynamicResourceAllocation
+	if dra == nil || !dra.Enabled {
+		return tiers
+	}
+	resourceName := corev1.ResourceName("nvidia.com/gpu")
+	if engine.Spec.GPUVendor != nil && *engine.Spec.GPUVendor == lmcachev1alpha1.GPUVendorAMD {
+		resourceName = "amd.com/gpu"
+	}
+	gpusPerUnit := float64(dra.EffectiveDRAGPUsPerUnit())
+	maxMultiplier := dra.EffectiveDRAMaxMultiplier()
+
+	gpus := map[string]float64{}
+	for _, pod := range pods {
+		total := 0.0
+		for i := range pod.Spec.Containers {
+			if q, ok := pod.Spec.Containers[i].Resources.Requests[resourceName]; ok {
+				total += q.AsApproximateFloat64()
+			}
+		}
+		gpus[pod.Spec.NodeName] += total
+	}
+	for node, total := range gpus {
+		m := int32(math.Ceil(total / gpusPerUnit))
+		if m < 1 {
+			m = 1
+		}
+		if m > maxMultiplier {
+			m = maxMultiplier
+		}
+		tiers[node] = m
+	}
+	return tiers
+}
+
+// nextTierChange returns the earliest pending tier-change application
+// deadline (zero when none), for the caller's requeue.
+func nextTierChange(tierChangeSince map[string]metav1.Time, engine *lmcachev1alpha1.LMCacheEngine, now time.Time) time.Time {
+	dra := engine.Spec.WorkloadAwareScheduling.DynamicResourceAllocation
+	if dra == nil || !dra.Enabled {
+		return time.Time{}
+	}
+	delay := dra.EffectiveDRATierChangeDelay()
+	var next time.Time
+	for _, since := range tierChangeSince {
+		deadline := since.Add(delay)
+		if now.Before(deadline) && (next.IsZero() || deadline.Before(next)) {
+			next = deadline
+		}
+	}
+	return next
+}
+
+// pruneStaleTierChanges drops tier-change bookkeeping for nodes that are
+// neither labeled nor desired.
+func pruneStaleTierChanges(
+	tierChangeSince map[string]metav1.Time,
+	labeled map[string]*corev1.Node,
+	desiredSet map[string]struct{},
+) {
+	for nodeName := range tierChangeSince {
+		_, isLabeled := labeled[nodeName]
+		_, isDesired := desiredSet[nodeName]
+		if !isLabeled && !isDesired {
+			delete(tierChangeSince, nodeName)
+		}
+	}
+}
+
+// earliest returns the earlier of two zeroable times.
+func earliest(a, b time.Time) time.Time {
+	switch {
+	case a.IsZero():
+		return b
+	case b.IsZero():
+		return a
+	case b.Before(a):
+		return b
+	default:
+		return a
+	}
 }
 
 // reconcileWorkloadPlacementOff handles a disabled feature: strip residue
@@ -176,6 +307,10 @@ func reconcileWorkloadPlacementOff(ctx context.Context, c client.Client, engine 
 	changed := false
 	if engine.Status.NodeAbsentSince != nil {
 		engine.Status.NodeAbsentSince = nil
+		changed = true
+	}
+	if engine.Status.NodeTierChangeSince != nil {
+		engine.Status.NodeTierChangeSince = nil
 		changed = true
 	}
 	if len(engine.Status.WorkloadNodes) > 0 {
@@ -192,21 +327,41 @@ func reconcileWorkloadPlacementOff(ctx context.Context, c client.Client, engine 
 	return c.Status().Update(ctx, engine)
 }
 
-// listLabeledNodes returns the nodes currently carrying the managed label.
+// listLabeledNodes returns the nodes currently carrying the managed label
+// (any value: with dynamic resource allocation the value is the node's
+// tier multiplier).
 func listLabeledNodes(ctx context.Context, c client.Client, key string) (map[string]*corev1.Node, error) {
-	labeled := map[string]*corev1.Node{}
+	return nodesCarryingLabel(ctx, c, key)
+}
+
+// nodesCarryingLabel lists all nodes and keeps those carrying the key —
+// a key-presence scan, not a value match, because the label value varies
+// ("1", "2", ...) once dynamic resource allocation is enabled.
+func nodesCarryingLabel(ctx context.Context, c client.Client, key string) (map[string]*corev1.Node, error) {
 	nodeList := &corev1.NodeList{}
-	if err := c.List(ctx, nodeList, client.MatchingLabels{key: resources.WorkloadLabelValue}); err != nil {
-		return nil, fmt.Errorf("listing labeled nodes: %w", err)
+	if err := c.List(ctx, nodeList); err != nil {
+		return nil, fmt.Errorf("listing nodes: %w", err)
 	}
+	labeled := map[string]*corev1.Node{}
 	for i := range nodeList.Items {
-		labeled[nodeList.Items[i].Name] = &nodeList.Items[i]
+		if _, ok := nodeList.Items[i].Labels[key]; ok {
+			labeled[nodeList.Items[i].Name] = &nodeList.Items[i]
+		}
 	}
 	return labeled, nil
 }
 
-// ensureDesiredWorkloadLabels labels every desired node and clears absence
-// bookkeeping the moment the workload returns to a node.
+// ensureDesiredWorkloadLabels labels every desired node with its tier
+// value and clears absence bookkeeping the moment the workload returns
+// to a node.
+//
+// Tier handling: a node NOT yet labeled gets the label immediately
+// (placement — delaying it would leave the workload engineless); a node
+// already labeled at a different tier is relabeled only once the change
+// has been continuously observed for tierChangeDelaySeconds
+// (hysteresis: the relabel restarts the engine pod and drops its warm L1,
+// and workload rolling updates transiently change the GPU sum). An
+// unlabeled DRA-off node is (re)labeled with the base value "1".
 //
 // Add failures are collected per node rather than returned eagerly so one
 // stuck node does not prevent labeling the others; the joined error is
@@ -219,13 +374,29 @@ func ensureDesiredWorkloadLabels(
 	labeled map[string]*corev1.Node,
 	desired []string,
 	desiredSet map[string]struct{},
-	key, value string,
+	key string,
+	tiers map[string]int32,
 	absentSince map[string]metav1.Time,
+	tierChangeSince map[string]metav1.Time,
+	now time.Time,
+	engine *lmcachev1alpha1.LMCacheEngine,
 ) error {
+	dra := engine.Spec.WorkloadAwareScheduling.DynamicResourceAllocation
+	tierDelay := time.Duration(0)
+	if dra != nil && dra.Enabled {
+		tierDelay = dra.EffectiveDRATierChangeDelay()
+	}
+
 	var errs []error
 	for _, node := range desired {
+		value := resources.WorkloadLabelValueBase
+		if tier, ok := tiers[node]; ok {
+			value = resources.TierLabelValue(tier)
+		}
+
+		var target *corev1.Node
 		if n, ok := labeled[node]; ok {
-			errs = append(errs, addWorkloadLabel(ctx, c, n, key, value))
+			target = n
 		} else {
 			fresh := &corev1.Node{}
 			if err := c.Get(ctx, client.ObjectKey{Name: node}, fresh); err != nil {
@@ -239,8 +410,34 @@ func ensureDesiredWorkloadLabels(
 				errs = append(errs, err)
 				continue
 			}
-			errs = append(errs, addWorkloadLabel(ctx, c, fresh, key, value))
+			target = fresh
 		}
+
+		if target.Labels[key] == value {
+			// Already at the desired tier: any pending change is moot.
+			delete(tierChangeSince, node)
+			delete(absentSince, node)
+			continue
+		}
+		if _, wasLabeled := labeled[node]; !wasLabeled {
+			// First placement — label immediately.
+			errs = append(errs, addWorkloadLabel(ctx, c, target, key, value))
+			delete(absentSince, node)
+			delete(tierChangeSince, node)
+			continue
+		}
+		// Labeled at a different tier: apply after the hysteresis window.
+		since, tracked := tierChangeSince[node]
+		if !tracked {
+			since = metav1.Time{Time: now}
+			tierChangeSince[node] = since
+		}
+		if now.Before(since.Add(tierDelay)) {
+			delete(absentSince, node)
+			continue // still inside the tier-change window
+		}
+		errs = append(errs, addWorkloadLabel(ctx, c, target, key, value))
+		delete(tierChangeSince, node)
 		delete(absentSince, node)
 	}
 	return errors.Join(errs...)
@@ -322,7 +519,7 @@ func pruneStaleWorkloadAbsence(
 }
 
 // updateWorkloadPlacementStatus persists the kept bookkeeping and the visible
-// node set. Empty absence maps are written as nil to avoid chronic churn.
+// node set. Empty bookkeeping maps are written as nil to avoid chronic churn.
 func updateWorkloadPlacementStatus(
 	ctx context.Context,
 	c client.Client,
@@ -330,6 +527,7 @@ func updateWorkloadPlacementStatus(
 	key string,
 	desiredSet map[string]struct{},
 	absentSince map[string]metav1.Time,
+	tierChangeSince map[string]metav1.Time,
 ) error {
 	changed := false
 	if !timesEqual(absentSince, engine.Status.NodeAbsentSince) {
@@ -337,6 +535,14 @@ func updateWorkloadPlacementStatus(
 			engine.Status.NodeAbsentSince = absentSince
 		} else {
 			engine.Status.NodeAbsentSince = nil
+		}
+		changed = true
+	}
+	if !timesEqual(tierChangeSince, engine.Status.NodeTierChangeSince) {
+		if len(tierChangeSince) > 0 {
+			engine.Status.NodeTierChangeSince = tierChangeSince
+		} else {
+			engine.Status.NodeTierChangeSince = nil
 		}
 		changed = true
 	}
@@ -374,12 +580,12 @@ func stripWorkloadPlacementLabels(ctx context.Context, c client.Client, engine *
 }
 
 func purgeWorkloadLabels(ctx context.Context, c client.Client, key string) error {
-	nodes := &corev1.NodeList{}
-	if err := c.List(ctx, nodes, client.MatchingLabels{key: resources.WorkloadLabelValue}); err != nil {
+	nodes, err := nodesCarryingLabel(ctx, c, key)
+	if err != nil {
 		return err
 	}
-	for i := range nodes.Items {
-		if err := removeWorkloadLabel(ctx, c, &nodes.Items[i], key); err != nil {
+	for _, node := range nodes {
+		if err := removeWorkloadLabel(ctx, c, node, key); err != nil {
 			return err
 		}
 	}

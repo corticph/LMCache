@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -142,5 +143,90 @@ func TestWorkloadReleaseDelay_Disabled(t *testing.T) {
 	}
 	if e.WorkloadSchedulingEnabled() {
 		t.Fatal("expected WorkloadSchedulingEnabled false")
+	}
+}
+
+func enabledDRA() *DynamicResourceAllocationSpec {
+	return &DynamicResourceAllocationSpec{Enabled: true}
+}
+
+func TestValidate_DRARequiresWLA(t *testing.T) {
+	e := &LMCacheEngine{}
+	e.Spec.WorkloadAwareScheduling = enabledWAS()
+	e.Spec.WorkloadAwareScheduling.Enabled = false
+	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation = enabledDRA()
+	errs := e.ValidateSpec()
+	if len(errs) == 0 {
+		t.Fatal("DRA without WLA must be rejected")
+	}
+}
+
+func TestValidate_DRARejectsResourceOverrides(t *testing.T) {
+	e := &LMCacheEngine{}
+	e.Spec.WorkloadAwareScheduling = enabledWAS()
+	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation = enabledDRA()
+	e.Spec.ResourceOverrides = &corev1.ResourceRequirements{}
+	errs := e.ValidateSpec()
+	found := false
+	for _, err := range errs {
+		if err.Field == "spec.resourceOverrides" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("resourceOverrides + DRA must be rejected at spec.resourceOverrides, got %v", errs)
+	}
+}
+
+func TestValidate_DRARejectsUnsupportedVendor(t *testing.T) {
+	e := &LMCacheEngine{}
+	e.Spec.WorkloadAwareScheduling = enabledWAS()
+	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation = enabledDRA()
+	vendor := "habana"
+	e.Spec.GPUVendor = &vendor
+	errs := e.ValidateSpec()
+	if len(errs) == 0 {
+		t.Fatal("DRA with a vendor that has no known GPU resource name must be rejected")
+	}
+}
+
+func TestValidate_DRARejectsTooLongEngineName(t *testing.T) {
+	e := &LMCacheEngine{}
+	e.Name = string(make([]byte, 63)) // 63 chars of NUL; only length matters
+	e.Spec.WorkloadAwareScheduling = enabledWAS()
+	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation = enabledDRA()
+	errs := e.ValidateSpec()
+	if len(errs) == 0 {
+		t.Fatal("an engine name leaving no room for the -<N>x tier suffix must be rejected")
+	}
+}
+
+func TestValidate_DRAValidEnginePasses(t *testing.T) {
+	e := &LMCacheEngine{}
+	e.Name = "s1"
+	e.Spec.WorkloadAwareScheduling = enabledWAS()
+	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation = enabledDRA()
+	e.Spec.L1.SizeGB = 10
+	errs := e.ValidateSpec()
+	if len(errs) != 0 {
+		t.Fatalf("valid DRA engine must pass, got %v", errs)
+	}
+}
+
+func TestDRAEffectiveDefaults(t *testing.T) {
+	dra := &DynamicResourceAllocationSpec{Enabled: true}
+	if dra.EffectiveDRAGPUsPerUnit() != 1 {
+		t.Fatal("gpusPerUnit default must be 1")
+	}
+	if dra.EffectiveDRAMaxMultiplier() != 8 {
+		t.Fatal("maxMultiplier default must be 8")
+	}
+	if dra.EffectiveDRATierChangeDelay().Seconds() != 300 {
+		t.Fatal("tierChangeDelaySeconds default must be 300s")
+	}
+	g, m, d := int32(4), int32(3), int32(0)
+	dra = &DynamicResourceAllocationSpec{Enabled: true, GPUsPerUnit: &g, MaxMultiplier: &m, TierChangeDelaySeconds: &d}
+	if dra.EffectiveDRAGPUsPerUnit() != 4 || dra.EffectiveDRAMaxMultiplier() != 3 || dra.EffectiveDRATierChangeDelay() != 0 {
+		t.Fatal("explicit DRA values must win over defaults")
 	}
 }

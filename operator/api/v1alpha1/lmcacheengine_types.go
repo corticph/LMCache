@@ -640,10 +640,63 @@ type WorkloadAwareSchedulingSpec struct {
 	// across brief workload churn such as same-node rolling updates, at the
 	// cost of lingering engines while the workload is gone. Defaults to 300.
 	//
-	// +optional
 	// +kubebuilder:default=300
 	// +kubebuilder:validation:Minimum=0
 	ReleaseDelaySeconds *int32 `json:"releaseDelaySeconds,omitempty"`
+
+	// dynamicResourceAllocation enables per-node tiered resource scaling
+	// on top of workload-aware scheduling: the operator derives a tier
+	// multiplier per node from the GPU requests of the matching workload
+	// pods and runs one scaled DaemonSet per active tier. See
+	// DynamicResourceAllocationSpec.
+	//
+	// +optional
+	DynamicResourceAllocation *DynamicResourceAllocationSpec `json:"dynamicResourceAllocation,omitempty"`
+}
+
+// DynamicResourceAllocationSpec configures per-node tiered resource scaling.
+// When enabled, the operator derives a tier multiplier from the GPU requests
+// of the matching workload pods on each node and runs one DaemonSet per
+// active tier: the base DaemonSet (tier 1x) plus <engine>-<N>x DaemonSets
+// for N >= 2, whose L1 size and memory requests are scaled by N.
+type DynamicResourceAllocationSpec struct {
+	// enabled turns dynamic resource allocation on. Requires
+	// workloadAwareScheduling.enabled: tier derivation reads the same
+	// workload pods that placement follows.
+	Enabled bool `json:"enabled"`
+
+	// gpusPerUnit is the number of workload GPUs per 1x tier unit. The
+	// multiplier of a node is ceil(total workload GPUs on that node /
+	// gpusPerUnit), clamped to [1, maxMultiplier]. GPU requests are read
+	// from the regular containers' resource requests for the engine's
+	// gpuVendor (nvidia.com/gpu / amd.com/gpu); init containers do not
+	// count. Default: 1.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	GPUsPerUnit *int32 `json:"gpusPerUnit,omitempty"`
+
+	// maxMultiplier is the upper bound on the tier multiplier. It must be
+	// sized so that ceil(maxMultiplier * l1.sizeGB + 5) Gi fits a node's
+	// allocatable memory: a tier whose request exceeds allocatable leaves
+	// the engine pod Pending with no further feedback. Default: 8.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=8
+	MaxMultiplier *int32 `json:"maxMultiplier,omitempty"`
+
+	// tierChangeDelaySeconds is how long a changed tier multiplier must
+	// be observed stable on a node before the node is relabeled — which
+	// restarts the engine pod there and drops its warm L1. This damps
+	// churn from workload rolling updates (surge pods transiently change
+	// the GPU sum). 0 applies changes immediately. Default: 300.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=300
+	TierChangeDelaySeconds *int32 `json:"tierChangeDelaySeconds,omitempty"`
 }
 
 // EndpointStatus represents a single LMCache instance endpoint.
@@ -677,11 +730,16 @@ type LMCacheEngineStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// desiredInstances is the number of desired instances.
+	// desiredInstances is the number of desired instances across ALL
+	// DaemonSets owned by the engine (the base DaemonSet plus any tier
+	// DaemonSets when dynamicResourceAllocation is enabled).
 	// +optional
 	DesiredInstances int32 `json:"desiredInstances,omitempty"`
 
-	// readyInstances is the number of ready instances.
+	// readyInstances is the number of ready engine pods across ALL
+	// DaemonSets owned by the engine, counted from the pod list (not from
+	// per-DaemonSet status counters, which are ambiguous under
+	// overlapping DaemonSet selectors).
 	// +optional
 	ReadyInstances int32 `json:"readyInstances,omitempty"`
 
@@ -704,9 +762,21 @@ type LMCacheEngineStatus struct {
 
 	// workloadLabelKey is the node label key this engine manages for
 	// workload-aware scheduling, for dashboards and debugging. The label
-	// value is always "true". Empty when the feature is disabled.
+	// value is the node's tier multiplier ("1" without
+	// dynamicResourceAllocation, "1".."N" with it). Empty when the
+	// feature is disabled.
 	// +optional
 	WorkloadLabelKey string `json:"workloadLabelKey,omitempty"`
+
+	// nodeTierChangeSince records when a node's computed tier multiplier
+	// first differed from its current label value. The relabel (and the
+	// engine-pod restart it causes) is applied once the change has been
+	// stably observed for tierChangeDelaySeconds. Internal bookkeeping;
+	// entries clear when the computed tier returns to the labeled value or
+	// the node is released.
+	// +optional
+	// +kubebuilder:example={"node-a":"2026-10-19T09:00:00Z"}
+	NodeTierChangeSince map[string]metav1.Time `json:"nodeTierChangeSince,omitempty"`
 
 	// nodeAbsentSince records when a node carrying the managed label was
 	// FIRST observed without matching workload pods. The release window runs

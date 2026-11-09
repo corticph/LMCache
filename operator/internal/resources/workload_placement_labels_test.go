@@ -59,8 +59,8 @@ func TestWorkloadPlacementLabelPinned(t *testing.T) {
 	if key != want {
 		t.Fatalf("label key = %q, want %q — hash function changed, labels orphaned on upgrade!", key, want)
 	}
-	if value != "true" {
-		t.Fatalf("label value = %q, want %q", value, "true")
+	if value != WorkloadLabelValueBase {
+		t.Fatalf("label value = %q, want %q", value, WorkloadLabelValueBase)
 	}
 	if len(key) > 63 {
 		t.Fatalf("label key %q exceeds the 63-character label key budget", key)
@@ -122,7 +122,7 @@ func TestEffectiveNodeSelector_EnabledMergesAddedKey(t *testing.T) {
 	if got["workload"] != testNodeSelectorValue || got["gpu-type"] != "h100" {
 		t.Fatalf("user nodeSelector must survive the merge: %v", got)
 	}
-	if got[key] != WorkloadLabelValue {
+	if got[key] != WorkloadLabelValueBase {
 		t.Fatalf("managed label %s=%q missing from merged selector: %v", key, got[key], got)
 	}
 	if len(got) != 3 {
@@ -136,7 +136,7 @@ func TestEffectiveNodeSelector_EnabledEmptyUserSelector(t *testing.T) {
 	engine := workloadAwareEngine()
 	got := EffectiveNodeSelector(wlLabelTestNS, engine.Name, &engine.Spec)
 	key, _ := WorkloadPlacementLabel("mlservices", "engine")
-	if got[key] != WorkloadLabelValue {
+	if got[key] != WorkloadLabelValueBase {
 		t.Fatalf("managed label missing on empty user selector: %v", got)
 	}
 	if len(got) != 1 {

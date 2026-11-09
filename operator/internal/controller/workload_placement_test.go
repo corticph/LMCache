@@ -108,7 +108,7 @@ func labelSnapshot(ctx context.Context, t *testing.T, c client.Client, key strin
 		t.Fatal(err)
 	}
 	for _, n := range nodes.Items {
-		if v, ok := n.Labels[key]; ok && v == resources.WorkloadLabelValue {
+		if v, ok := n.Labels[key]; ok && v == resources.WorkloadLabelValueBase {
 			out[n.Name] = true
 		}
 	}

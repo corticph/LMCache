@@ -5299,6 +5299,56 @@ spec:
                   are created only where the workload runs and are removed shortly after
                   it leaves (see releaseDelaySeconds).
                 properties:
+                  dynamicResourceAllocation:
+                    description: |-
+                      dynamicResourceAllocation enables per-node tiered resource scaling
+                      on top of workload-aware scheduling: the operator derives a tier
+                      multiplier per node from the GPU requests of the matching workload
+                      pods and runs one scaled DaemonSet per active tier. See
+                      DynamicResourceAllocationSpec.
+                    properties:
+                      enabled:
+                        description: |-
+                          enabled turns dynamic resource allocation on. Requires
+                          workloadAwareScheduling.enabled: tier derivation reads the same
+                          workload pods that placement follows.
+                        type: boolean
+                      gpusPerUnit:
+                        default: 1
+                        description: |-
+                          gpusPerUnit is the number of workload GPUs per 1x tier unit. The
+                          multiplier of a node is ceil(total workload GPUs on that node /
+                          gpusPerUnit), clamped to [1, maxMultiplier]. GPU requests are read
+                          from the regular containers' resource requests for the engine's
+                          gpuVendor (nvidia.com/gpu / amd.com/gpu); init containers do not
+                          count. Default: 1.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxMultiplier:
+                        default: 8
+                        description: |-
+                          maxMultiplier is the upper bound on the tier multiplier. It must be
+                          sized so that ceil(maxMultiplier * l1.sizeGB + 5) Gi fits a node's
+                          allocatable memory: a tier whose request exceeds allocatable leaves
+                          the engine pod Pending with no further feedback. Default: 8.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      tierChangeDelaySeconds:
+                        default: 300
+                        description: |-
+                          tierChangeDelaySeconds is how long a changed tier multiplier must
+                          be observed stable on a node before the node is relabeled — which
+                          restarts the engine pod there and drops its warm L1. This damps
+                          churn from workload rolling updates (surge pods transiently change
+                          the GPU sum). 0 applies changes immediately. Default: 300.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    required:
+                    - enabled
+                    type: object
                   enabled:
                     description: |-
                       enabled turns workload-aware scheduling on. When false or the whole
@@ -5441,7 +5491,10 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               desiredInstances:
-                description: desiredInstances is the number of desired instances.
+                description: |-
+                  desiredInstances is the number of desired instances across ALL
+                  DaemonSets owned by the engine (the base DaemonSet plus any tier
+                  DaemonSets when dynamicResourceAllocation is enabled).
                 format: int32
                 type: integer
               endpoints:
@@ -5493,6 +5546,20 @@ spec:
                 example:
                   node-a: "2026-10-19T09:00:00Z"
                 type: object
+              nodeTierChangeSince:
+                additionalProperties:
+                  format: date-time
+                  type: string
+                description: |-
+                  nodeTierChangeSince records when a node's computed tier multiplier
+                  first differed from its current label value. The relabel (and the
+                  engine-pod restart it causes) is applied once the change has been
+                  stably observed for tierChangeDelaySeconds. Internal bookkeeping;
+                  entries clear when the computed tier returns to the labeled value or
+                  the node is released.
+                example:
+                  node-a: "2026-10-19T09:00:00Z"
+                type: object
               observedGeneration:
                 description: observedGeneration is the most recent generation observed.
                 format: int64
@@ -5501,14 +5568,20 @@ spec:
                 description: phase is the overall phase of the LMCacheEngine.
                 type: string
               readyInstances:
-                description: readyInstances is the number of ready instances.
+                description: |-
+                  readyInstances is the number of ready engine pods across ALL
+                  DaemonSets owned by the engine, counted from the pod list (not from
+                  per-DaemonSet status counters, which are ambiguous under
+                  overlapping DaemonSet selectors).
                 format: int32
                 type: integer
               workloadLabelKey:
                 description: |-
                   workloadLabelKey is the node label key this engine manages for
                   workload-aware scheduling, for dashboards and debugging. The label
-                  value is always "true". Empty when the feature is disabled.
+                  value is the node's tier multiplier ("1" without
+                  dynamicResourceAllocation, "1".."N" with it). Empty when the
+                  feature is disabled.
                 type: string
               workloadNodes:
                 description: |-
