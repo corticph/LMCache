@@ -238,12 +238,7 @@ func computeNodeTiers(engine *lmcachev1alpha1.LMCacheEngine, pods []*corev1.Pod)
 	}
 	for node, total := range gpus {
 		m := int32(math.Ceil(total / gpusPerUnit))
-		if m < 1 {
-			m = 1
-		}
-		if m > maxMultiplier {
-			m = maxMultiplier
-		}
+		m = max(int32(1), min(m, maxMultiplier))
 		tiers[node] = m
 	}
 	return tiers

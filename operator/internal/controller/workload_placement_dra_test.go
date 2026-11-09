@@ -35,10 +35,11 @@ import (
 
 // --- DRA fixtures -----------------------------------------------------------
 
-// newDraEngine returns a WLA+DRA engine with an explicit tier-change delay
-// (tests pass 0 for immediacy or a value for hysteresis assertions).
-func newDraEngine(name string, tierDelaySecs int32) *lmcachev1alpha1.LMCacheEngine {
-	e := newWlasEngine(name, 300)
+// newDraEngine returns a WLA+DRA engine (named "s1", the shared fixture
+// name of this suite) with an explicit tier-change delay (tests pass 0
+// for immediacy or a value for hysteresis assertions).
+func newDraEngine(tierDelaySecs int32) *lmcachev1alpha1.LMCacheEngine {
+	e := newWlasEngine("s1", 300)
 	e.Spec.L1.SizeGB = 10
 	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation =
 		&lmcachev1alpha1.DynamicResourceAllocationSpec{
@@ -75,7 +76,7 @@ func intToStr(n int64) string {
 	return string(digits)
 }
 
-func reconcileOnce(ctx context.Context, t *testing.T, c client.Client, r *LMCacheEngineReconciler, name string) ctrl.Result {
+func reconcileOnce(ctx context.Context, t *testing.T, r *LMCacheEngineReconciler, name string) {
 	t.Helper()
 	_, err := r.Reconcile(ctx, ctrl.Request{
 		NamespacedName: types.NamespacedName{Namespace: wlasTestNamespace, Name: name},
@@ -83,7 +84,6 @@ func reconcileOnce(ctx context.Context, t *testing.T, c client.Client, r *LMCach
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	return ctrl.Result{}
 }
 
 // getDS fetches a DaemonSet or returns nil when absent.
@@ -107,14 +107,14 @@ func getDS(ctx context.Context, t *testing.T, c client.Client, name string) *app
 // templates share the instance label.
 func TestDRA_TierDaemonSetsPerNodeGPUCount(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 0)
+	engine := newDraEngine(0)
 	podA := gpuPod("pa", "gpu-a", 1)
 	podB := gpuPod("pb", "gpu-b", 2)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podA, podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	// Node labels carry tiers.
 	nodeA := &corev1.Node{}
@@ -185,13 +185,13 @@ func TestDRA_TierDaemonSetsPerNodeGPUCount(t *testing.T) {
 // label is immediate — hysteresis only guards changes.
 func TestDRA_HysteresisDelaysTierRelabel(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 300)
+	engine := newDraEngine(300)
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	node := &corev1.Node{}
 	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
@@ -206,7 +206,7 @@ func TestDRA_HysteresisDelaysTierRelabel(t *testing.T) {
 	if err := c.Update(ctx, podB2); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
 		t.Fatal(err)
 	}
@@ -232,17 +232,17 @@ func TestDRA_HysteresisDelaysTierRelabel(t *testing.T) {
 // relabel lands on the very next reconcile.
 func TestDRA_TierChangeDelayZeroAppliesImmediately(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 0)
+	engine := newDraEngine(0)
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-b"), podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 	if err := c.Update(ctx, gpuPod("pb", "gpu-b", 2)); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	node := &corev1.Node{}
 	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-b"}, node); err != nil {
@@ -261,13 +261,13 @@ func TestDRA_TierChangeDelayZeroAppliesImmediately(t *testing.T) {
 // existing WLA-off path.
 func TestDRA_DisableDeletesTierDS(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 0)
+	engine := newDraEngine(0)
 	podA := gpuPod("pa", "gpu-a", 1)
 	podB := gpuPod("pb", "gpu-b", 2)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podA, podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 	if getDS(ctx, t, c, "s1-2x") == nil {
 		t.Fatal("tier DS must exist while DRA is on")
 	}
@@ -280,7 +280,7 @@ func TestDRA_DisableDeletesTierDS(t *testing.T) {
 	if err := c.Update(ctx, e); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	if getDS(ctx, t, c, "s1-2x") != nil {
 		t.Fatal("tier DS must be deleted after DRA disable")
@@ -294,13 +294,13 @@ func TestDRA_DisableDeletesTierDS(t *testing.T) {
 // node drops to 1 GPU (node relabeled "1"), the tier DS is deleted.
 func TestDRA_TierEmptiesOutDeletesTierDS(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 0)
+	engine := newDraEngine(0)
 	podA := gpuPod("pa", "gpu-a", 1)
 	podB := gpuPod("pb", "gpu-b", 2)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podA, podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 	if getDS(ctx, t, c, "s1-2x") == nil {
 		t.Fatal("tier DS must exist while tier 2 is active")
 	}
@@ -308,8 +308,8 @@ func TestDRA_TierEmptiesOutDeletesTierDS(t *testing.T) {
 	if err := c.Update(ctx, gpuPod("pb", "gpu-b", 1)); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOnce(ctx, t, c, r, "s1")
-	reconcileOnce(ctx, t, c, r, "s1") // zero delay applies on the pass that records it
+	reconcileOnce(ctx, t, r, "s1")
+	reconcileOnce(ctx, t, r, "s1") // zero delay applies on the pass that records it
 
 	if getDS(ctx, t, c, "s1-2x") != nil {
 		t.Fatal("tier DS must be deleted when no node carries tier 2")
@@ -322,13 +322,13 @@ func TestDRA_TierEmptiesOutDeletesTierDS(t *testing.T) {
 // is seeded manually.
 func TestDRA_StatusAggregatesAcrossTiers(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 0)
+	engine := newDraEngine(0)
 	podA := gpuPod("pa", "gpu-a", 1)
 	podB := gpuPod("pb", "gpu-b", 2)
 	c := wlasReconcileClient(t, engine, nodeNamed("gpu-a"), nodeNamed("gpu-b"), podA, podB)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	// Seed DS status as the DS controller would.
 	for _, name := range []string{"s1", "s1-2x"} {
@@ -342,7 +342,7 @@ func TestDRA_StatusAggregatesAcrossTiers(t *testing.T) {
 		}
 	}
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	e := &lmcachev1alpha1.LMCacheEngine{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
@@ -358,7 +358,7 @@ func TestDRA_StatusAggregatesAcrossTiers(t *testing.T) {
 // ownerRef + tier label, never by name pattern.
 func TestDRA_NameCollisionS1AndS12x(t *testing.T) {
 	ctx := context.Background()
-	s1 := newDraEngine("s1", 0)
+	s1 := newDraEngine(0)
 	s2 := newWlasEngine("s1-2x", 300) // plain WLA engine, no DRA
 	podA := gpuPod("pa", "gpu-a", 1)
 	podB := gpuPod("pb", "gpu-b", 2)
@@ -366,8 +366,8 @@ func TestDRA_NameCollisionS1AndS12x(t *testing.T) {
 	c := wlasReconcileClient(t, s1, s2, nodeNamed("gpu-a"), nodeNamed("gpu-b"), nodeNamed("gpu-c"), podA, podB, podC)
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 
-	reconcileOnce(ctx, t, c, r, "s1")
-	reconcileOnce(ctx, t, c, r, "s1-2x")
+	reconcileOnce(ctx, t, r, "s1")
+	reconcileOnce(ctx, t, r, "s1-2x")
 
 	// s1's tier DS exists ALONGSIDE s1-2x's own base DS — same object
 	// name is impossible, so the tier DS must have lost the race only
@@ -393,7 +393,7 @@ func TestDRA_EnableOnExistingEngineKeepsBaseSelector(t *testing.T) {
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 
 	// Pre-DRA reconcile creates the base DS.
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 	base := getDS(ctx, t, c, "s1")
 	if base == nil {
 		t.Fatal("base DS missing after pre-DRA reconcile")
@@ -412,7 +412,7 @@ func TestDRA_EnableOnExistingEngineKeepsBaseSelector(t *testing.T) {
 	if err := c.Update(ctx, e); err != nil {
 		t.Fatal(err)
 	}
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	base = getDS(ctx, t, c, "s1")
 	if base == nil {
@@ -429,7 +429,7 @@ func TestDRA_EnableOnExistingEngineKeepsBaseSelector(t *testing.T) {
 // nor contribute GPUs to its tier.
 func TestDRA_GPUFilterMatchesPlacement(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 0)
+	engine := newDraEngine(0)
 	active := gpuPod("pa", "gpu-a", 1)
 	unbound := boundPod(wlasTestNamespace, "punbound", "", map[string]string{"app": "predictor"})
 	terminating := boundPod(wlasTestNamespace, "pterm", "gpu-a", map[string]string{"app": "predictor"})
@@ -459,7 +459,7 @@ func TestDRA_GPUFilterMatchesPlacement(t *testing.T) {
 	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
 
-	reconcileOnce(ctx, t, c, r, "s1")
+	reconcileOnce(ctx, t, r, "s1")
 
 	node := &corev1.Node{}
 	if err := c.Get(ctx, client.ObjectKey{Name: "gpu-a"}, node); err != nil {
@@ -476,7 +476,7 @@ func TestDRA_GPUFilterMatchesPlacement(t *testing.T) {
 // directly so `now` can be injected (mirrors the WLA release-window tests).
 func TestDRA_HysteresisAppliesAfterWindow(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 300)
+	engine := newDraEngine(300)
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasClient(t, engine, nodeNamed("gpu-b"), podB)
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
@@ -535,7 +535,7 @@ func TestDRA_HysteresisAppliesAfterWindow(t *testing.T) {
 // DS selects "1", so the residue would hide the node's engine pod.
 func TestDRA_NonNumericResidueRelabeledImmediately(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 300)
+	engine := newDraEngine(300)
 	podB := gpuPod("pb", "gpu-b", 1)
 	node := nodeNamed("gpu-b")
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
@@ -559,7 +559,7 @@ func TestDRA_NonNumericResidueRelabeledImmediately(t *testing.T) {
 // window restarts for the new target.
 func TestDRA_HysteresisRestartsOnNewTarget(t *testing.T) {
 	ctx := context.Background()
-	engine := newDraEngine("s1", 300)
+	engine := newDraEngine(300)
 	podB := gpuPod("pb", "gpu-b", 1)
 	c := wlasClient(t, engine, nodeNamed("gpu-b"), podB)
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "s1")
