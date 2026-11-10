@@ -93,7 +93,7 @@ func wlasClient(t *testing.T, objs ...client.Object) client.Client {
 
 func mustPlacementReconcile(ctx context.Context, t *testing.T, c client.Client, e *lmcachev1alpha1.LMCacheEngine, now time.Time) time.Duration {
 	t.Helper()
-	delay, err := reconcileWorkloadPlacement(ctx, c, e, now)
+	delay, _, err := reconcileWorkloadPlacement(ctx, c, e, now)
 	if err != nil {
 		t.Fatalf("reconcileWorkloadPlacement: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestWorkloadPlacement_DesiredNodeNotFoundIsSkipped(t *testing.T) {
 		boundPod(wlasTestNamespace, "p2", "gpu-ghost", map[string]string{"app": "predictor"}))
 	key := resources.WorkloadPlacementLabel(wlasTestNamespace, "engine")
 
-	if _, err := reconcileWorkloadPlacement(ctx, c, e, time.Now()); err != nil {
+	if _, _, err := reconcileWorkloadPlacement(ctx, c, e, time.Now()); err != nil {
 		t.Fatalf("missing node object must be skipped, not fail the reconcile: %v", err)
 	}
 	// The healthy node still got labeled (the bad node didn't block it).

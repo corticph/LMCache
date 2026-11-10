@@ -49,6 +49,7 @@ const (
 	ConditionAvailable         = "Available"
 	ConditionAllInstancesReady = "AllInstancesReady"
 	ConditionConfigValid       = "ConfigValid"
+	ConditionTierSchedulable   = "TierSchedulable"
 )
 
 // ImageSpec defines the container image to use.
