@@ -98,8 +98,9 @@ func TierNodeSelector(namespace, name string, spec *lmcachev1alpha1.LMCacheEngin
 
 // WorkloadPlacementLabel returns the node label key an LMCacheEngine
 // manages on nodes hosting its matching workload pods. The key embeds an
-// 8-hex fnv64a hash of "namespace/name": deterministic, collision-safe
-// for practical fleet sizes, and terse. The label's value is the node's
+// 16-hex fnv64a hash of "namespace/name" (the full uint64 as %x):
+// deterministic, collision-safe for practical fleet sizes, and still
+// well inside the 63-char key budget. The label's value is the node's
 // tier multiplier — WorkloadLabelValueBase ("1") unless dynamic resource
 // allocation is enabled.
 func WorkloadPlacementLabel(namespace, name string) string {
