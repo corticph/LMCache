@@ -23,6 +23,7 @@ import (
 	"maps"
 	"math"
 	"sort"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,8 +55,12 @@ import (
 const removalRetryDelay = 30 * time.Second
 
 // workloadSelectorFor parses spec.workloadAwareScheduling.workloadSelector.
-// Malformed selectors error here; the validating webhook rejects them at
-// admission, so a parse failure only surfaces if validation was bypassed.
+// Malformed selectors error here. Validation runs at RECONCILE time
+// (validateAndSetCondition — the operator has no validating admission
+// webhook, only mutating pod injectors), so the API server accepts
+// invalid selectors and the controller's ValidateSpec is the gate: a
+// parse failure here means the engine already went Failed via the
+// ConfigValid condition; the error is belt-and-suspenders.
 func workloadSelectorFor(engine *lmcachev1alpha1.LMCacheEngine) (labels.Selector, error) {
 	parsed, err := metav1.LabelSelectorAsSelector(engine.Spec.WorkloadAwareScheduling.WorkloadSelector)
 	if err != nil {
@@ -127,16 +132,16 @@ func matchingWorkloadPods(ctx context.Context, c client.Client, engine *lmcachev
 // only side affinity-only placement ever had.
 func reconcileWorkloadPlacement(
 	ctx context.Context, c client.Client, engine *lmcachev1alpha1.LMCacheEngine, now time.Time,
-) (time.Duration, error) {
+) (time.Duration, map[int32]struct{}, error) {
 	key := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
 
 	if !engine.WorkloadSchedulingEnabled() {
-		return 0, reconcileWorkloadPlacementOff(ctx, c, engine, key)
+		return 0, nil, reconcileWorkloadPlacementOff(ctx, c, engine, key)
 	}
 
 	pods, err := matchingWorkloadPods(ctx, c, engine)
 	if err != nil {
-		return 0, fmt.Errorf("listing workload pods: %w", err)
+		return 0, nil, fmt.Errorf("listing workload pods: %w", err)
 	}
 	desired := sortedNodeNames(pods)
 	desiredSet := make(map[string]struct{}, len(desired))
@@ -150,7 +155,7 @@ func reconcileWorkloadPlacement(
 
 	labeled, err := listLabeledNodes(ctx, c, key)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	// Copy-on-write bookkeeping: entries are only persisted when a pass
@@ -165,7 +170,7 @@ func reconcileWorkloadPlacement(
 	}
 
 	if err := ensureDesiredWorkloadLabels(ctx, c, labeled, desired, desiredSet, key, tiers, absentSince, tierChanges, now, engine); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	nextExpiry := releaseExpiredWorkloadNodes(ctx, c, labeled, desiredSet, absentSince, engine.WorkloadReleaseDelay(), now, key)
@@ -182,14 +187,38 @@ func reconcileWorkloadPlacement(
 	nextTierApply := nextTierChange(tierChanges, engine, now)
 
 	if err := updateWorkloadPlacementStatus(ctx, c, engine, key, desiredSet, absentSince, tierChanges); err != nil {
-		return 0, err
+		return 0, nil, err
+	}
+
+	// Effective tier set: what the tier DaemonSets must cover RIGHT NOW —
+	// the label values the placement pass left on the nodes (hysteresis
+	// may hold some at their old tier). Computed from the in-memory node
+	// objects this pass just patched, NOT by re-reading node labels
+	// through the (possibly stale) watch cache in the same reconcile.
+	effective := make(map[int32]struct{}, len(labeled)+len(desiredSet))
+	for _, node := range labeled {
+		if v, err := strconv.Atoi(node.Labels[key]); err == nil && v >= 1 {
+			effective[int32(v)] = struct{}{}
+		}
+	}
+	// Nodes labeled for the FIRST time this pass (the immediate
+	// placement path) are not in `labeled` — their desired tier applies.
+	for _, node := range desired {
+		if _, ok := labeled[node]; ok {
+			continue
+		}
+		if tier, ok := tiers[node]; ok {
+			effective[tier] = struct{}{}
+		} else {
+			effective[1] = struct{}{}
+		}
 	}
 
 	next := earliest(nextExpiry, nextTierApply)
 	if next.IsZero() {
-		return 0, nil
+		return 0, effective, nil
 	}
-	return next.Sub(now), nil
+	return next.Sub(now), effective, nil
 }
 
 // sortedNodeNames deduplicates and sorts the nodes of the given pods.

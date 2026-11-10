@@ -115,19 +115,25 @@ func (r *LMCacheEngineReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	//    pod and drop every warm KV cache while the old selector lives.
 	var requeueAfter time.Duration
 	cleanUpWorkloadPlacement := false
+	var effectiveTiers map[int32]struct{}
 	if engine.WorkloadSchedulingEnabled() {
 		if !controllerutil.ContainsFinalizer(engine, workloadPlacementFinalizer) {
-			controllerutil.AddFinalizer(engine, workloadPlacementFinalizer)
-			if err := r.Update(ctx, engine); err != nil {
+			// Metadata-only patch: the in-memory engine has already been
+			// through SetDefaults() (step 3) and may hold defaulted fields
+			// (gpuVendor, logLevel, the injected nodeSelector) the user
+			// never wrote — a full Update would persist them into the
+			// stored spec, bumping the generation and fighting GitOps.
+			if err := r.patchFinalizer(ctx, engine, workloadPlacementFinalizer, true); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
-		delay, err := reconcileWorkloadPlacement(ctx, r.Client, engine, time.Now())
+		delay, tiers, err := reconcileWorkloadPlacement(ctx, r.Client, engine, time.Now())
 		if err != nil {
 			log.Error(err, "Failed to reconcile workload-aware placement labels")
 			return ctrl.Result{}, err
 		}
 		requeueAfter = delay
+		effectiveTiers = tiers
 	} else if controllerutil.ContainsFinalizer(engine, workloadPlacementFinalizer) {
 		// Disabled-after-enabled: nothing happens here yet — only the DS
 		// step below drops the label key from the live selector first.
@@ -145,10 +151,12 @@ func (r *LMCacheEngineReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 7.2 Reconcile tier DaemonSets (dynamic resource allocation): create
 	//     or patch one DS per active tier N>=2, delete owned tier DSs
-	//     whose tier is no longer active. Runs after the base DS step so
-	//     nodes are labeled before the DS nodeSelectors ask for the tier
-	//     values (the placement step 6 above owns the labeling order).
-	if err := r.reconcileTierDaemonSets(ctx, engine); err != nil {
+	//     whose tier is no longer active. The tier set comes from the
+	//     placement pass above (the label values it just wrote), not from
+	//     a re-read of node labels — the watch cache may not have caught
+	//     up with our own patches, which would delay tier DS creation by
+	//     a reconcile.
+	if err := r.reconcileTierDaemonSets(ctx, engine, effectiveTiers); err != nil {
 		log.Error(err, "Failed to reconcile tier DaemonSets")
 		return ctrl.Result{}, err
 	}
@@ -235,13 +243,17 @@ func (r *LMCacheEngineReconciler) purgeWorkloadPlacement(ctx context.Context, en
 	}
 
 	// Selector is label-free (or no DaemonSet exists): safe to purge.
-	if _, err := reconcileWorkloadPlacement(ctx, r.Client, engine, time.Now()); err != nil {
+	if _, _, err := reconcileWorkloadPlacement(ctx, r.Client, engine, time.Now()); err != nil {
 		return false, err
 	}
 	// reconcileWorkloadPlacement's off path does not know about the
-	// finalizer; strip it and persist.
-	controllerutil.RemoveFinalizer(engine, workloadPlacementFinalizer)
-	if err := r.Update(ctx, engine); err != nil {
+	// finalizer; strip it via a metadata-only patch. A full Update here
+	// would be worse than drift: reconcileDaemonSet earlier overwrote
+	// engine.Spec.Coordinator with its RESOLVED value (ref AND url set),
+	// and writing that back would permanently break coordinator-ref
+	// engines ("exactly one of ref or url must be set" on every later
+	// validation).
+	if err := r.patchFinalizer(ctx, engine, workloadPlacementFinalizer, false); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -403,3 +415,47 @@ func (r *LMCacheEngineReconciler) enginesForNode(ctx context.Context, _ client.O
 
 // Ensure resources package is used (for linter).
 var _ = resources.StandardLabels
+
+// patchFinalizer adds or removes the workload-placement finalizer via a
+// metadata-only patch against a freshly fetched copy of the CR. The
+// in-memory engine passed through Reconcile may have been mutated since
+// its fetch — SetDefaults() fills defaulted spec fields and
+// reconcileDaemonSet resolves spec.coordinator (ref AND url) — and a
+// full-object Update would persist those mutations into the stored spec,
+// bumping the generation and, for coordinator.ref engines, permanently
+// failing validation ("exactly one of ref or url must be set"). A
+// strategic-merge patch scoped to metadata.finalizers writes nothing else.
+func (r *LMCacheEngineReconciler) patchFinalizer(
+	ctx context.Context,
+	engine *lmcachev1alpha1.LMCacheEngine,
+	finalizer string,
+	add bool,
+) error {
+	fresh := &lmcachev1alpha1.LMCacheEngine{}
+	if err := r.Get(ctx, types.NamespacedName{Name: engine.Name, Namespace: engine.Namespace}, fresh); err != nil {
+		return err
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	if add {
+		controllerutil.AddFinalizer(fresh, finalizer)
+	} else {
+		controllerutil.RemoveFinalizer(fresh, finalizer)
+	}
+	// Keep the in-memory engine's finalizer state in sync so later steps
+	// in this reconcile (e.g. the finalizer-removal check at step 6.5)
+	// agree with the API server. resourceVersion staleness is fine:
+	// updateStatus re-fetches the engine before its status write.
+	if add {
+		controllerutil.AddFinalizer(engine, finalizer)
+	} else {
+		controllerutil.RemoveFinalizer(engine, finalizer)
+	}
+	if err := r.Patch(ctx, fresh, patch); err != nil {
+		return err
+	}
+	// Sync the in-memory engine so later full-object writes in THIS
+	// reconcile (Status().Update from the placement step) carry the
+	// post-patch resourceVersion instead of conflicting.
+	engine.ResourceVersion = fresh.ResourceVersion
+	return nil
+}

@@ -187,7 +187,9 @@ func (r *LMCacheEngineReconciler) reconcileDaemonSet(ctx context.Context, engine
 // lmcache.ai/dra-tier template label — never by name pattern: a CR
 // literally named "s1-2x" owns its own base DS, and another engine's
 // tier DS "s1-2x" must not be confused with it (or vice versa).
-func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(ctx context.Context, engine *lmcachev1alpha1.LMCacheEngine) error {
+func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(
+	ctx context.Context, engine *lmcachev1alpha1.LMCacheEngine, activeTiers map[int32]struct{},
+) error {
 	list := &appsv1.DaemonSetList{}
 	if err := r.List(ctx, list,
 		client.InNamespace(engine.Namespace),
@@ -196,11 +198,6 @@ func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(ctx context.Context, e
 		return err
 	}
 	owned := ownedTierDaemonSets(list.Items, engine)
-
-	activeTiers, err := r.activeTiers(ctx, engine)
-	if err != nil {
-		return err
-	}
 
 	// Reconcile every active tier N >= 2.
 	for tier := range activeTiers {
@@ -237,8 +234,8 @@ func (r *LMCacheEngineReconciler) reconcileTierDaemonSets(ctx context.Context, e
 	// Delete owned tier DSs whose tier is not active (workload shrank,
 	// feature disabled, WLA disabled). A DS still terminating does not
 	// block anything: the purge guard reads only the base DS by name.
-	for name, ds := range owned {
-		if _, active := activeTiers[tierOfDS(name)]; active {
+	for _, ds := range owned {
+		if _, active := activeTiers[tierOfDaemonSet(ds, engine.Name)]; active {
 			continue
 		}
 		if err := r.Delete(ctx, ds); err != nil && !apierrors.IsNotFound(err) {
@@ -267,41 +264,23 @@ func ownedTierDaemonSets(items []appsv1.DaemonSet, engine *lmcachev1alpha1.LMCac
 	return owned
 }
 
-// activeTiers returns the distinct tier multipliers among the nodes the
-// engine currently has labeled, with tier 1 always included (the base DS
-// always exists). Empty set when DRA is disabled.
-func (r *LMCacheEngineReconciler) activeTiers(ctx context.Context, engine *lmcachev1alpha1.LMCacheEngine) (map[int32]struct{}, error) {
-	tiers := map[int32]struct{}{}
-	if !engine.DynamicResourceAllocationEnabled() {
-		return tiers, nil
+// tierOfDaemonSet decodes the tier multiplier of a tier DaemonSet from
+// its dra-tier template label VALUE — the single identity the operator
+// stamped at creation, never a name pattern (a CR named "s1-2x" must not
+// be misread from a DS name). The label value is the DS name
+// "<engine>-<N>x" (see resources.TierDaemonSetName), which the operator
+// itself generated; a parse failure can only be foreign residue, and
+// tier 1 makes the DS ineligible for the active-tier cleanup either way.
+func tierOfDaemonSet(ds *appsv1.DaemonSet, engineName string) int32 {
+	value, ok := ds.Spec.Template.Labels[resources.TierLabelKey]
+	if !ok || value == engineName {
+		return 1 // base DS (no tier label) — never deleted by tier cleanup
 	}
-	key := resources.WorkloadPlacementLabel(engine.Namespace, engine.Name)
-	labeled, err := listLabeledNodes(ctx, r.Client, key)
-	if err != nil {
-		return nil, err
-	}
-	for _, node := range labeled {
-		m, err := strconv.ParseInt(node.Labels[key], 10, 32)
-		if err != nil {
-			// A non-numeric residue (e.g. a pre-DRA "true" value):
-			// treat as tier 1 — the next placement pass relabels it.
-			m = 1
-		}
-		tiers[int32(m)] = struct{}{}
-	}
-	return tiers, nil
-}
-
-// tierOfDS extracts the tier multiplier from a tier DS name
-// "<engine>-<N>x". The name is operator-generated (TierDaemonSetName), so
-// ParseInt failure means a foreign object the ownerRef filter should have
-// excluded; tier 1 makes its (already-deleted) DS ineligible either way.
-func tierOfDS(dsName string) int32 {
-	i := strings.LastIndex(dsName, "-")
-	if i < 0 || !strings.HasSuffix(dsName, "x") {
+	i := strings.LastIndex(value, "-")
+	if i < 0 || !strings.HasSuffix(value, "x") {
 		return 1
 	}
-	m, err := strconv.ParseInt(dsName[i+1:len(dsName)-1], 10, 32)
+	m, err := strconv.ParseInt(value[i+1:len(value)-1], 10, 32)
 	if err != nil || m <= 1 {
 		return 1
 	}
@@ -600,6 +579,26 @@ func (r *LMCacheEngineReconciler) updateStatus(ctx context.Context, engine *lmca
 		})
 	}
 	engine.Status.Endpoints = endpoints
+
+	// TierSchedulable: a tier pod stuck Pending leaves its node with NO
+	// engine (the base DS already released it) — the tier's scaled
+	// request (ceil(N*l1+5) Gi) does not fit next to the workload.
+	// Surface it instead of failing silently; the operator does not
+	// auto-demote the tier (that would flap against hysteresis).
+	pending := make([]string, 0, 2)
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Spec.NodeName == "" && pod.Status.Phase == corev1.PodPending {
+			pending = append(pending, pod.Name)
+		}
+	}
+	meta.SetStatusCondition(&engine.Status.Conditions, metav1.Condition{
+		Type:               lmcachev1alpha1.ConditionTierSchedulable,
+		Status:             conditionBool(len(pending) == 0),
+		Reason:             reasonFromReady(len(pending) == 0, "AllScheduled", "TierPodPending"),
+		Message:            fmt.Sprintf("%d engine pod(s) unschedulable (tier request exceeds node allocatable)", len(pending)),
+		ObservedGeneration: engine.Generation,
+	})
 
 	return r.Status().Update(ctx, engine)
 }

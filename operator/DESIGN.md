@@ -508,16 +508,33 @@ Semantics worth knowing:
   `lmcache.ai/workload-placement-cleanup` finalizer; deletion first strips
   every managed label, then proceeds. Disabling the feature also strips
   residue immediately (after the label-free selector has landed, per the
-  ordering note above).
+  ordering note above). **This is a deliberate trade-off:** the finalizer
+  blocks CR deletion while the operator is down or uninstalling
+  (`kubectl delete -k config/default` hangs on WLAS-enabled CRs until the
+  operator comes back and strips the labels) — the alternative is
+  leaking per-engine labels on cluster nodes, which no GC can remove.
+  Uninstall orders that delete the operator Deployment before the CRs
+  must account for it (scale the operator to zero only after the CRs are
+  gone, or strip the labels by hand).
+- **Namespace scoping.** `workloadSelector` matches pods in the ENGINE's
+  namespace only. A workload in another namespace (KServe components are
+  commonly namespaced apart) matches nothing: no node is ever labeled
+  and the engine stays Pending with no pods — the status's
+  `workloadNodes` staying empty is the signal. Deploy the engine CR in
+  the same namespace as its workload (a namespace selector is a possible
+  follow-up if this proves limiting).
 - **RBAC footprint.** The controller needs `nodes: get, list, watch, patch`.
   Cluster-scoped `nodes: patch` cannot be narrowed by RBAC to label keys
-  only — clusters that care can add a ValidatingAdmissionPolicy restricting
-  the operator's service account to label changes on the
-  `lmcache.ai/wlas-` prefix. The controller also holds a Pod watch
-  (cluster-wide; placement-mapped per event) and a Node watch filtered to
-  managed-label changes — on clusters with many pods, the Pod informer
-  carries the usual memory cost of caching every pod in the cluster.
-- **Status.** `status.workloadLabelKey` names the managed key (for dashboards), `status.workloadNodes` the current labeled set, and `status.nodeAbsentSince` the release-window bookkeeping (see `releaseDelaySeconds` above for the first-observed-absence semantics).
+  only — the grant covers taints, unschedulable and any label, not just
+  `lmcache.ai/wlas-*`. Clusters that care can add a
+  ValidatingAdmissionPolicy restricting the operator's service account
+  to label changes on the `lmcache.ai/wlas-` prefix. The controller also
+  holds a Pod watch (cluster-wide; placement-mapped per event) and a
+  Node watch filtered to managed-label changes — on clusters with many
+  pods, the Pod informer carries the usual memory cost of caching every
+  pod in the cluster.
+
+- **Status.** `status.workloadLabelKey` names the managed key (for dashboards), `status.workloadNodes` the current labeled set, and `status.nodeAbsentSince` the release-window bookkeeping (see `releaseDelaySeconds` above for the first-observed-absence semantics). With DRA on, `status.nodeTierChanges` tracks pending tier changes.
 
 ### Why a node label at all
 
@@ -601,20 +618,35 @@ fields mean "across the whole fleet" now, not "the one DS".
 
 **Limitations / sizing.** `maxMultiplier` must be sized so
 `ceil(maxMultiplier * l1.sizeGB + 5) Gi` fits a node's allocatable
-memory: an oversized tier pod stays Pending with no operator feedback (no
-event is emitted in v1). `spec.resourceOverrides` is rejected with DRA
-enabled — tier DSs scale the auto-computed memory, and overrides would
-silently bypass it; scaling overrides proportionally is a possible
-follow-up. `gpuVendor` must be `nvidia` or `amd`, and the engine name must
-leave room for the `-<N>x` suffix (the `dra-tier` label value is capped at
-63 characters; validation rejects over-long names). Only the standard
-resource names `nvidia.com/gpu` / `amd.com/gpu` count toward the tier; MIG
-and other fractional GPU resource names (or GPU-Operator time-slicing
-without per-pod claims) leave the node at tier 1 — biased small, never
-over-provisioning. With `spec.hostNetwork: true`, a tier change briefly
-contends the old pod and the new tier pod for the same host ports; the
-scheduler holds the new pod Pending until the old one exits, so expect a
-short engine gap on the node during the swap.
+memory: an oversized tier pod stays Pending, which surfaces via the
+`TierSchedulable` status condition (False, reason `TierPodPending`) but
+the node it should cover runs WITHOUT an engine until memory frees up —
+the base DS already released it. The operator does not auto-demote the
+tier (that would flap against the hysteresis window); size
+`maxMultiplier` for the smallest node in the fleet. Every tier change is
+also a deliberate node-local engine outage: the old pod dies before the
+new tier pod pins its L1 (~1 GB/s pin rate — tier 8 at l1=60GB is about
+eight minutes). During that window the vLLM pods on the node have no
+KV connector server; serving requests fall back to vLLM's local cache /
+origin recomputation until the engine is Ready. The hysteresis window
+(`tierChangeDelaySeconds`) bounds how OFTEN this happens, not how long
+it lasts — budget it into rollout planning. `spec.resourceOverrides` is
+rejected with DRA enabled — tier DSs scale the auto-computed memory,
+and overrides would silently bypass it; scaling overrides
+proportionally is a possible follow-up. `gpuVendor` must be `nvidia` or
+`amd`, and the engine name must leave room for the `-<N>x` suffix (the
+`dra-tier` label value is capped at 63 characters; validation rejects
+over-long names). Only the standard resource names `nvidia.com/gpu` /
+`amd.com/gpu` count toward the tier; MIG (`nvidia.com/mig-*`),
+ResourceClaim-based GPUs (core-k8s DRA, resource.k8s.io), and
+GPU-Operator time-slicing without per-pod claims are invisible to the
+tier math — those nodes stay at tier 1, biased small, never
+over-provisioning. The field name `dynamicResourceAllocation` refers to
+this per-node tiered sizing only and is unrelated to core Kubernetes
+DRA (resource.k8s.io). With `spec.hostNetwork: true`, a tier change
+briefly contends the old pod and the new tier pod for the same host
+ports; the scheduler holds the new pod Pending until the old one exits,
+so expect a short engine gap on the node during the swap.
 
 ## Validation
 
