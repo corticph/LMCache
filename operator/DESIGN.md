@@ -579,7 +579,9 @@ run. Fractional requests are summed, then rounded up once.
 label's value becomes the tier: `"1"` with DRA off (identical semantics to
 the previous `"true"`), `"1".."N"` with it. Presence and tier are stamped
 atomically in one label write, so a DS can never reference a tier value
-before the node carries it.
+before the node carries it. The fnv64a key has no collision detection —
+the probability is negligible, but two colliding engines (especially DRA
+engines with different tiers) would flap each other's label values.
 
 **DaemonSet fleet.** The base DS keeps its name and its selector
 (`instance=<engine>`) unchanged — `spec.selector` is immutable, so enabling
@@ -653,8 +655,9 @@ so expect a short engine gap on the node during the swap.
 `workloadSelector` is required when enabled, and must be non-empty and
 syntactically valid: an empty `LabelSelector` matches every pod (one
 malformed CR would label every node running anything in the namespace),
-and unknown operators or `In`-without-values reject at admission via
-upstream `LabelSelector` syntax validation rather than failing per-event
+and unknown operators or `In`-without-values are rejected at validation
+time via upstream `LabelSelector` syntax validation, surfacing as
+`ConfigValid=False` at reconcile time, rather than failing per-event
 in the controller.
 
 ---

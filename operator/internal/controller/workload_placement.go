@@ -201,9 +201,9 @@ func reconcileWorkloadPlacement(
 			effective[int32(v)] = struct{}{}
 		}
 	}
-	// Nodes labeled for the FIRST time this pass (the immediate
-	// placement path) are not in `labeled` — their desired tier applies.
-	for _, node := range desired {
+	// First-placement nodes are not in `labeled`, so their desired tier
+	// applies; a NotFound ghost dropped from desiredSet cannot activate a tier DS.
+	for node := range desiredSet {
 		if _, ok := labeled[node]; ok {
 			continue
 		}

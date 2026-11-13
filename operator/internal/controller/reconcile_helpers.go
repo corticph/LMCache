@@ -580,25 +580,26 @@ func (r *LMCacheEngineReconciler) updateStatus(ctx context.Context, engine *lmca
 	}
 	engine.Status.Endpoints = endpoints
 
-	// TierSchedulable: a tier pod stuck Pending leaves its node with NO
-	// engine (the base DS already released it) — the tier's scaled
-	// request (ceil(N*l1+5) Gi) does not fit next to the workload.
-	// Surface it instead of failing silently; the operator does not
-	// auto-demote the tier (that would flap against hysteresis).
-	pending := make([]string, 0, 2)
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if pod.Spec.NodeName == "" && pod.Status.Phase == corev1.PodPending {
-			pending = append(pending, pod.Name)
+	// TierSchedulable is DRA-only and cleared when DRA is off (a pending
+	// base pod is ordinary scheduling); auto-demoting the tier would flap hysteresis.
+	if engine.DynamicResourceAllocationEnabled() {
+		pending := make([]string, 0, 2)
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if pod.Spec.NodeName == "" && pod.Status.Phase == corev1.PodPending {
+				pending = append(pending, pod.Name)
+			}
 		}
+		meta.SetStatusCondition(&engine.Status.Conditions, metav1.Condition{
+			Type:               lmcachev1alpha1.ConditionTierSchedulable,
+			Status:             conditionBool(len(pending) == 0),
+			Reason:             reasonFromReady(len(pending) == 0, "AllScheduled", "TierPodPending"),
+			Message:            fmt.Sprintf("%d engine pod(s) unschedulable (tier request exceeds node allocatable)", len(pending)),
+			ObservedGeneration: engine.Generation,
+		})
+	} else {
+		meta.RemoveStatusCondition(&engine.Status.Conditions, lmcachev1alpha1.ConditionTierSchedulable)
 	}
-	meta.SetStatusCondition(&engine.Status.Conditions, metav1.Condition{
-		Type:               lmcachev1alpha1.ConditionTierSchedulable,
-		Status:             conditionBool(len(pending) == 0),
-		Reason:             reasonFromReady(len(pending) == 0, "AllScheduled", "TierPodPending"),
-		Message:            fmt.Sprintf("%d engine pod(s) unschedulable (tier request exceeds node allocatable)", len(pending)),
-		ObservedGeneration: engine.Generation,
-	})
 
 	return r.Status().Update(ctx, engine)
 }

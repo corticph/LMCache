@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -74,6 +75,14 @@ func intToStr(n int64) string {
 		n /= 10
 	}
 	return string(digits)
+}
+
+// pendingEnginePod returns a stuck-Pending engine pod (no nodeName)
+// carrying the DS selector labels, so updateStatus's pod list matches it.
+func pendingEnginePod(engineName, name string) *corev1.Pod {
+	pod := boundPod(wlasTestNamespace, name, "", resources.SelectorLabels(engineName))
+	pod.Status.Phase = corev1.PodPending
+	return pod
 }
 
 func reconcileOnce(ctx context.Context, t *testing.T, r *LMCacheEngineReconciler, name string) {
@@ -316,6 +325,27 @@ func TestDRA_TierEmptiesOutDeletesTierDS(t *testing.T) {
 	}
 }
 
+// TestDRA_GhostNodeTierDoesNotActivateTierDS: a workload pod bound to a
+// deleted node (pre-GC race) must not activate a tier DS that can never
+// schedule a pod.
+func TestDRA_GhostNodeTierDoesNotActivateTierDS(t *testing.T) {
+	ctx := context.Background()
+	engine := newDraEngine(0)
+	podA := gpuPod("pa", "node-a", 1)
+	ghost := gpuPod("pg", "ghost-node", 3) // tier 3, Node object absent
+	c := wlasReconcileClient(t, engine, nodeNamed("node-a"), podA, ghost)
+	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
+
+	reconcileOnce(ctx, t, r, "s1")
+
+	if ds := getDS(ctx, t, c, "s1-3x"); ds != nil {
+		t.Fatal("a ghost node's tier must not activate a tier DS")
+	}
+	if getDS(ctx, t, c, "s1") == nil {
+		t.Fatal("base DS missing")
+	}
+}
+
 // TestDRA_StatusAggregatesAcrossTiers: desiredInstances sums over owned
 // DSs; endpoints match pods of every tier via the shared instance label.
 // The fake client does not run DS controllers, so DesiredNumberScheduled
@@ -350,6 +380,83 @@ func TestDRA_StatusAggregatesAcrossTiers(t *testing.T) {
 	}
 	if e.Status.DesiredInstances != 2 {
 		t.Fatalf("DesiredInstances = %d, want 2 (sum over both DSs)", e.Status.DesiredInstances)
+	}
+}
+
+// TestDRA_TierConditionGatedOnDRA: with DRA on, a stuck-Pending engine pod
+// surfaces as TierSchedulable=False / TierPodPending.
+func TestDRA_TierConditionGatedOnDRA(t *testing.T) {
+	ctx := context.Background()
+	engine := newDraEngine(0)
+	c := wlasReconcileClient(t, engine, pendingEnginePod("s1", "stuck"))
+	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
+
+	reconcileOnce(ctx, t, r, "s1")
+
+	e := &lmcachev1alpha1.LMCacheEngine{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(e.Status.Conditions, lmcachev1alpha1.ConditionTierSchedulable)
+	if cond == nil {
+		t.Fatal("TierSchedulable condition missing")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Fatalf("TierSchedulable status = %q, want False", cond.Status)
+	}
+	if cond.Reason != "TierPodPending" {
+		t.Fatalf("TierSchedulable reason = %q, want TierPodPending", cond.Reason)
+	}
+}
+
+// TestDRA_TierConditionNotSetWithoutDRA: a WLA-only engine gets no
+// TierSchedulable condition — a pending base pod is ordinary scheduling.
+func TestDRA_TierConditionNotSetWithoutDRA(t *testing.T) {
+	ctx := context.Background()
+	engine := newWlasEngine("s1", 300)
+	c := wlasReconcileClient(t, engine, pendingEnginePod("s1", "stuck"))
+	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
+
+	reconcileOnce(ctx, t, r, "s1")
+
+	e := &lmcachev1alpha1.LMCacheEngine{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	if cond := meta.FindStatusCondition(e.Status.Conditions, lmcachev1alpha1.ConditionTierSchedulable); cond != nil {
+		t.Fatalf("TierSchedulable must not be set without DRA: %+v", cond)
+	}
+}
+
+// TestDRA_TierConditionClearedWhenDRADisabled: disabling DRA removes a
+// previously-set False condition instead of leaving it stale.
+func TestDRA_TierConditionClearedWhenDRADisabled(t *testing.T) {
+	ctx := context.Background()
+	engine := newDraEngine(0)
+	c := wlasReconcileClient(t, engine, pendingEnginePod("s1", "stuck"))
+	r := &LMCacheEngineReconciler{Client: c, Scheme: wlasReconcileScheme(t)}
+
+	reconcileOnce(ctx, t, r, "s1")
+	e := &lmcachev1alpha1.LMCacheEngine{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	cond := meta.FindStatusCondition(e.Status.Conditions, lmcachev1alpha1.ConditionTierSchedulable)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "TierPodPending" {
+		t.Fatalf("condition must be False/TierPodPending before the disable, got %+v", cond)
+	}
+
+	e.Spec.WorkloadAwareScheduling.DynamicResourceAllocation.Enabled = false
+	if err := c.Update(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(ctx, t, r, "s1")
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: wlasTestNamespace, Name: "s1"}, e); err != nil {
+		t.Fatal(err)
+	}
+	if cond := meta.FindStatusCondition(e.Status.Conditions, lmcachev1alpha1.ConditionTierSchedulable); cond != nil {
+		t.Fatalf("TierSchedulable must be removed after DRA disable, got %+v", cond)
 	}
 }
 
